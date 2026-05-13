@@ -357,15 +357,15 @@ export function CredentialCard({
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
             </Button>
-            {credential.disabled && credential.authMethod !== 'api_key' && (
+            {credential.authMethod !== 'api_key' && (credential.disabled || credential.failureCount > 0 || credential.refreshFailureCount > 0) && (
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => setShowUpdateTokenDialog(true)}
-                title="为已禁用的凭据更新 refreshToken"
+                title={credential.disabled ? '重新导入新 Token 并自动启用' : '凭据存在失败记录，可重新导入 Token'}
               >
                 <RefreshCw className="h-4 w-4 mr-1" />
-                更新 Token
+                重新导入
               </Button>
             )}
             <Button
