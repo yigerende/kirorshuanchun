@@ -66,7 +66,11 @@ export interface SetPriorityRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
+  accessToken?: string
+  profileArn?: string
+  expiresAt?: string
   authMethod?: 'social' | 'idc' | 'api_key'
+  provider?: string
   clientId?: string
   clientSecret?: string
   priority?: number

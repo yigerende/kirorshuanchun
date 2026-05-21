@@ -10,6 +10,11 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+pub const SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +42,10 @@ pub struct KiroCredentials {
     /// 认证方式 (social / idc)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+
+    /// 身份提供商（KAM 导出字段：BuilderId / Enterprise / Github / Google / IAM_SSO）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +253,33 @@ impl KiroCredentials {
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
         }
+    }
+
+    pub fn fill_default_profile_arn(&mut self) -> bool {
+        if self.profile_arn.is_some() || self.is_api_key_credential() {
+            return false;
+        }
+
+        let is_social = self
+            .auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("social"))
+            .unwrap_or(false)
+            || self
+                .provider
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("github") || p.eq_ignore_ascii_case("google"))
+                .unwrap_or(false);
+
+        self.profile_arn = Some(
+            if is_social {
+                SOCIAL_PROFILE_ARN
+            } else {
+                BUILDER_ID_PROFILE_ARN
+            }
+            .to_string(),
+        );
+        true
     }
 
     /// 检查凭据是否支持 Opus 模型

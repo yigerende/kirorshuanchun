@@ -16,7 +16,6 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { CredentialCard } from '@/components/credential-card'
-import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { IdcLoginDialog } from '@/components/idc-login-dialog'
@@ -27,7 +26,7 @@ import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useResetAllSuccessCount } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, updateAdminKey } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { extractErrorMessage, parseError } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -35,8 +34,6 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
-  const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false)
@@ -131,11 +128,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     document.documentElement.classList.toggle('dark')
   }
 
-  const handleViewBalance = (id: number) => {
-    setSelectedCredentialId(id)
-    setBalanceDialogOpen(true)
-  }
-
   const handleRefresh = () => {
     refetch()
     toast.success('已刷新凭据列表')
@@ -146,6 +138,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryClient.clear()
     onLogout()
   }
+
+  useEffect(() => {
+    if (!error) {
+      return
+    }
+    const parsed = parseError(error)
+    if (parsed.type === 'authentication_error') {
+      toast.error('登录已失效，请重新登录')
+      handleLogout()
+    }
+  }, [error])
 
   // 选择管理
   const toggleSelect = (id: number) => {
@@ -566,7 +569,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <div className="text-red-500 mb-4">加载失败</div>
-            <p className="text-muted-foreground mb-4">{(error as Error).message}</p>
+            <p className="text-muted-foreground mb-4">{extractErrorMessage(error)}</p>
             <div className="space-x-2">
               <Button onClick={() => refetch()}>重试</Button>
               <Button variant="outline" onClick={handleLogout}>重新登录</Button>
@@ -795,7 +798,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
-                    onViewBalance={handleViewBalance}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -832,14 +834,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
           )}
         </div>
       </main>
-
-      {/* 余额对话框 */}
-      <BalanceDialog
-        credentialId={selectedCredentialId}
-        open={balanceDialogOpen}
-        onOpenChange={setBalanceDialogOpen}
-      />
-
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
         open={addDialogOpen}

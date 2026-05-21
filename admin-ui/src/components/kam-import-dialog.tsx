@@ -24,12 +24,17 @@ interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  idp?: string
   credentials: {
     refreshToken: string
+    accessToken?: string
+    profileArn?: string
+    expiresAt?: string
     clientId?: string
     clientSecret?: string
     region?: string
     authMethod?: string
+    provider?: string
     startUrl?: string
   }
   machineId?: string
@@ -65,25 +70,35 @@ function normalizeKamAccount(item: unknown): unknown {
           ? (obj.label as string)
           : undefined
     const status = typeof obj.status === 'string' ? obj.status : undefined
+    const idp = typeof obj.idp === 'string' ? obj.idp : undefined
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
+    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
+    const expiresAt = typeof obj.expiresAt === 'string' ? obj.expiresAt : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
+    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
 
     return {
       email,
       userId,
       nickname,
+      idp,
       status,
       machineId,
       credentials: {
         refreshToken: obj.refreshToken,
+        accessToken,
+        profileArn,
+        expiresAt,
         clientId,
         clientSecret,
         region,
         authMethod,
+        provider,
         startUrl,
       },
     }
@@ -276,6 +291,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const provider = cred.provider?.trim() || account.idp?.trim() || undefined
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -289,7 +305,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           const addedCred = await addCredential({
             refreshToken: token,
+            accessToken: cred.accessToken?.trim() || undefined,
+            profileArn: cred.profileArn?.trim() || undefined,
+            expiresAt: cred.expiresAt?.trim() || undefined,
             authMethod,
+            provider,
             authRegion: cred.region?.trim() || undefined,
             clientId,
             clientSecret,

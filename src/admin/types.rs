@@ -89,9 +89,25 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
+    /// 访问令牌（可选，来自 KAM 等导出时保留）
+    #[serde(default)]
+    pub access_token: Option<String>,
+
+    /// Profile ARN（可选，缺失时部分上游接口会拒绝请求）
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+
+    /// Token 过期时间（可选，RFC3339 格式）
+    #[serde(default)]
+    pub expires_at: Option<String>,
+
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
+
+    /// 身份提供商（兼容 Kiro Account Manager 导出）
+    #[serde(default)]
+    pub provider: Option<String>,
 
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,

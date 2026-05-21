@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { KeyRound } from 'lucide-react'
 import { storage } from '@/lib/storage'
+import { getCredentials } from '@/api/credentials'
+import { extractErrorMessage } from '@/lib/utils'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -11,6 +13,8 @@ interface LoginPageProps {
 
 export function LoginPage({ onLogin }: LoginPageProps) {
   const [apiKey, setApiKey] = useState('')
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     // 从 storage 读取保存的 API Key
@@ -20,11 +24,25 @@ export function LoginPage({ onLogin }: LoginPageProps) {
     }
   }, [])
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (apiKey.trim()) {
-      storage.setApiKey(apiKey.trim())
-      onLogin(apiKey.trim())
+    const key = apiKey.trim()
+    if (!key || isSubmitting) {
+      return
+    }
+
+    setIsSubmitting(true)
+    setError(null)
+    storage.setApiKey(key)
+
+    try {
+      await getCredentials()
+      onLogin(key)
+    } catch (err) {
+      storage.removeApiKey()
+      setError(extractErrorMessage(err))
+    } finally {
+      setIsSubmitting(false)
     }
   }
 
@@ -47,12 +65,21 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 type="password"
                 placeholder="Admin API Key"
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => {
+                  setApiKey(e.target.value)
+                  setError(null)
+                }}
                 className="text-center"
+                disabled={isSubmitting}
               />
             </div>
-            <Button type="submit" className="w-full" disabled={!apiKey.trim()}>
-              登录
+            {error && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {error}
+              </div>
+            )}
+            <Button type="submit" className="w-full" disabled={!apiKey.trim() || isSubmitting}>
+              {isSubmitting ? '登录中...' : '登录'}
             </Button>
           </form>
         </CardContent>

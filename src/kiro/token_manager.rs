@@ -338,7 +338,7 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 URL
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     );
 
@@ -579,6 +579,9 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
+                if cred.fill_default_profile_arn() {
+                    has_new_ids = true;
+                }
                 if cred.machine_id.is_none() {
                     cred.machine_id =
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
@@ -1896,6 +1899,11 @@ impl MultiTokenManager {
                 m
             }
         });
+        if new_cred.profile_arn.is_some() {
+            validated_cred.profile_arn = new_cred.profile_arn;
+        }
+        validated_cred.provider = new_cred.provider;
+        validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;

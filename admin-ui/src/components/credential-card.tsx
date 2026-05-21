@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil, LogIn } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Trash2, Loader2, Pencil, LogIn } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -31,7 +32,6 @@ import { ReloginDialog } from '@/components/relogin-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
-  onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -55,9 +55,17 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatNumber(num: number): string {
+  return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function formatResetDate(timestamp: number | null): string {
+  if (!timestamp) return '未知'
+  return new Date(timestamp * 1000).toLocaleString('zh-CN')
+}
+
 export function CredentialCard({
   credential,
-  onViewBalance,
   selected,
   onToggleSelect,
   balance,
@@ -266,7 +274,7 @@ export function CredentialCard({
                 {credential.refreshFailureCount}
               </span>
             </div>
-            <div>
+            <div className="col-span-2">
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
                 {loadingBalance ? (
@@ -295,23 +303,6 @@ export function CredentialCard({
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
-                <span className="text-sm ml-1">
-                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
-                </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
-              ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
-              )}
-            </div>
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
@@ -321,6 +312,51 @@ export function CredentialCard({
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
+              </div>
+            )}
+          </div>
+
+          {/* 余额信息 */}
+          <div className="rounded-md border bg-muted/20 p-3">
+            {loadingBalance ? (
+              <div className="flex items-center justify-center gap-2 py-4 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                正在查询余额...
+              </div>
+            ) : balance ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs text-muted-foreground">余额</div>
+                    <div className="text-base font-semibold text-green-600">
+                      ${formatNumber(balance.remaining)}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs text-muted-foreground">订阅</div>
+                    <div className="text-sm font-medium">
+                      {balance.subscriptionTitle || '未知'}
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-muted-foreground">
+                    <span>已用 ${formatNumber(balance.currentUsage)}</span>
+                    <span>额度 ${formatNumber(balance.usageLimit)}</span>
+                  </div>
+                  <Progress value={balance.usagePercentage} className="h-2" />
+                  <div className="flex justify-between text-xs text-muted-foreground">
+                    <span>{balance.usagePercentage.toFixed(1)}% 已使用</span>
+                    <span>{(100 - balance.usagePercentage).toFixed(1)}% 剩余</span>
+                  </div>
+                </div>
+                <div className="border-t pt-2 text-xs text-muted-foreground">
+                  下次重置：<span className="font-medium text-foreground">{formatResetDate(balance.nextResetAt)}</span>
+                </div>
+              </div>
+            ) : (
+              <div className="py-3 text-sm text-muted-foreground">
+                余额未查询。点击顶部“查询信息”后会直接显示在卡片中。
               </div>
             )}
           </div>
@@ -411,14 +447,6 @@ export function CredentialCard({
             >
               <Pencil className="h-4 w-4 mr-1" />
               编辑
-            </Button>
-            <Button
-              size="sm"
-              variant="default"
-              onClick={() => onViewBalance(credential.id)}
-            >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
             </Button>
             <Button
               size="sm"
