@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-05-30
+
+主题：凭据失败次数从单一"连续失败计数器"升级为**累计统计 + 按类型三色分类展示**。此前卡片"失败次数"绑定 `failure_count`（连续失败计数器，成功即清零、账号风控与瞬态不计入），导致鉴权失败被其他凭据救回后立即清零、账号风控压根不显示，与用户对"这个凭据到底失败了多少次、什么原因"的直觉不符。
+
+### ✨ 新功能 — 累计失败统计
+
+- **拆分计数,避免误禁用**：`token_manager` 新增 `total_failure_count`——所有失败类型（鉴权 / 额度 / 风控 / 瞬态 / 网络）都 +1、只增不减、仅手动「重置失败计数 / 恢复异常」(`reset_and_enable`) 时归零。原 `failure_count` 保持"连续失败、成功清零"语义,继续驱动"连续失败 N 次自动禁用",因此健康凭据不会被终身累计的失败数误禁用。持久化到 `kiro_stats.json`（`serde(default)` 向后兼容旧文件）,贯通快照 → admin API → 前端。
+
+### ✨ 新功能 — 失败次数按类型三色分类
+
+- **三色展示（鉴权 / 风控 / 其他）**：卡片"失败次数"改为 `auth / throttle / other` 三个分色数字（如 `3/1/2`,鉴权红、账号风控橙、其他灰）。数据来自 trace 库聚合——新增 `trace_db::failure_stats()` 对 `trace_attempts` 按 `credential_id + outcome` 分组 COUNT 并归并三类（鉴权=`auth_failed`、风控=`account_throttled`、其他=额度/瞬态/网络/请求错误/未知）。
+- **新接口 `GET /api/admin/traces/failure-stats`**：返回 `{credentialId: {auth, throttle, other}}`。前端 dashboard 每 30s 拉一次并按凭据分发给各卡片;无 trace 数据（trace 关闭 / 已过期清理）时回退显示 `totalFailureCount`。鼠标悬停 title 说明各类含义,点击仍打开失败日志详情弹框。
+
 ## [0.5.6] - 2026-05-30
 
 维护版本：仅版本号递增，无功能或代码变更（内容同 0.5.5）。用于刷新发布产物 / 镜像。
