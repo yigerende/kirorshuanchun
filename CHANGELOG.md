@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-06-07
+
+主题：**缓存命中/创建 token 精确计量 + 流式对话 profileArn 占位符 403 修复 + 后台前端组件统一**。上一版把流式端点改成始终发送 profileArn（含 BuilderID 占位符），但占位符指向调用者无权访问的 profile，仍会被上游以 `403 "User is not authorized to make this call"` 拒绝；这一版改为只发送真实 / Social 共享 ARN。同时把中转层缓存计量从粗略估算重写为按前缀链匹配 + 互斥口径分摊的精确计量，请求日志新增 token 列；后台前端把原生确认框 / 下拉框统一为风格一致的组件。
+
+### 🛠 修复 — 流式对话 profileArn 占位符 403
+
+- **占位符 ARN 不再发送**：`KiroCredentials::streaming_profile_arn()` 对 BuilderID 占位符（及未填充 profileArn 的 BuilderID 账号）返回 `None`。占位符指向调用者无权访问的 profile，发送会触发 `403 "User is not authorized to make this call"`；该端点本就不强制此字段。Enterprise / IdC 的真实 ARN 已由 `resolve_profile_arn_for` 回填，与 Social 共享 ARN 一并原样发送。
+
+### ✨ 改进 — 缓存命中 / 创建 token 精确计量
+
+- **前缀链匹配替代锚点**：缓存命中模拟改用「最长公共前缀」链式匹配，消除 `tool_result`（role=user）导致的「倒数第二个 user」锚点漂移，跨轮对话命中稳定。
+- **会话隔离**：按 `metadata` 的 user / session（缺失时回退 client key id）派生隔离种子，不同会话不会互相串缓存。
+- **互斥口径分摊**：`input` / `cache_creation` / `cache_read` 按比例分摊，保证三者互斥且总和等于 total，不再重复计入被缓存覆盖的前缀。
+- **token 估算与签名解耦**：哈希用签名、计量用原文，去除签名噪声对 token 数的污染。
+- **图片 token 估算**：按 `(宽 × 高) / 750` 估算（长边封顶 1568px），图片块的媒体类型 + 数据纳入缓存哈希。
+- **请求日志记录 token**：`traces.db` 新增 input / output / cache_creation / cache_read 列（幂等迁移），日志接口返回并合计 totalTokens。
+- 模块 `prompt_cache` 更名为 `cache_metering`，持久化文件相应更名。
+
+### ✨ 改进 — 后台前端组件统一
+
+- **统一二次确认弹窗**：新增 `useConfirm` / `ConfirmProvider`，全站确认操作改用风格一致的弹窗替代原生 `confirm()`。
+- **重写下拉框**：以 `DropdownMenu`（`modal={false}`）重写 `Select`，替换原生 `select` 与 radix `Select`。后者 Content 硬编码 `disableOutsidePointerEvents`，经 `DismissableLayer` 给 `body` 上 `pointer-events` 锁，嵌套在 Dialog 内同时关闭时卸载顺序竞态会把 body 误留为 `none` 导致整页不可点；non-modal 分支不触碰 body 锁，从源头规避。下拉默认值改为从 children 静态推导，修复菜单未打开时默认值显示为空。
+
 ## [0.6.0] - 2026-06-07
 
 主题：**Enterprise / IAM Identity Center 凭据全链路打通 + 流式对话 profileArn 修复 + 登录体验对齐官方 IDE**。此前导入或登录企业（Enterprise）IdC 账号后，获取订阅/用量会报 `403 {"message":"Invalid token"}`，且发起对话会报 `400 profileArn is required` / `403 bearer token invalid`——根因是这类账号在请求里带了 BuilderID 占位 profileArn 或缺失真实 profileArn。这一版定位并修复了用量查询与流式对话两条链路，同时把添加凭据 / 登录 / 导出的整体行为与官方 IDE / 账号管理器对齐，并新增 Enterprise 登录入口与一批凭据管理体验改进。
