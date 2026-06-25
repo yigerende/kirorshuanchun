@@ -153,14 +153,23 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 
 /// 默认的账号级风控判断逻辑
 ///
-/// 上游 Kiro/Q-Developer 风控会返回 429 + 类似：
-/// `Due to suspicious activity, we are imposing temporary limits on how
-/// frequently your account (d-...) can send a request to Kiro while we investigate.`
+/// 上游 Kiro/Q-Developer 风控有两种已知措辞，都属于"账号级临时限制、会自动恢复"：
 ///
-/// 与普通 429（high traffic / rate limit exceeded）的关键差异是
-/// 提到 "suspicious activity" 与具体账号 ID。
+/// 1. **429 限速型**：
+///    `Due to suspicious activity, we are imposing temporary limits on how
+///    frequently your account (d-...) can send a request to Kiro while we investigate.`
+///    （"suspicious activity" + "temporary limits"）
+///
+/// 2. **403 临时封锁型**：
+///    `Your user ID is temporarily suspended. We detected unusual user activity
+///    and locked it as a security precaution. To restore...`
+///    （"temporarily suspended" + "unusual user activity"）
+///
+/// 两者都是**临时**的（注意 temporary / temporarily），应按长冷却处理、到期自动回池，
+/// 而非计入连续失败被自愈反复复活、持续捅一个正在被风控的账号。
 pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity") && body.contains("temporary limits")
+    (body.contains("suspicious activity") && body.contains("temporary limits"))
+        || (body.contains("temporarily suspended") && body.contains("unusual user activity"))
 }
 
 /// 默认的"单账号请求速率超限"判断逻辑（429 + USER_REQUEST_RATE_EXCEEDED）。
@@ -286,6 +295,12 @@ mod tests {
         assert!(!default_is_account_throttled(
             "suspicious activity detected"
         ));
+        // 403 临时封锁型措辞应被识别为账号级风控（会自动恢复，走长冷却而非禁用）
+        let suspended = r#"{"message":"Your user ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution. To restore access, please wait."}"#;
+        assert!(default_is_account_throttled(suspended));
+        // 仅半边措辞不命中
+        assert!(!default_is_account_throttled("temporarily suspended"));
+        assert!(!default_is_account_throttled("unusual user activity"));
     }
 
     #[test]

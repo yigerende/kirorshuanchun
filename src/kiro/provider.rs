@@ -679,6 +679,63 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // 403 账号级临时风控（"temporarily suspended / unusual user activity"）：
+                // 这是会自动恢复的临时封锁，按长冷却处理、到期自动回池，
+                // 不计入连续失败——否则会被自愈反复复活、持续捅一个正在被风控的账号。
+                if status.as_u16() == 403
+                    && self.token_manager.get_account_throttle_failover()
+                    && endpoint.is_account_throttled(&body)
+                {
+                    let cooldown_secs = self
+                        .token_manager
+                        .get_account_throttle_cooldown_secs()
+                        .max(1);
+                    let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                    tracing::warn!(
+                        "API 请求失败（账号级临时封锁 403，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                        ctx.id,
+                        cooldown_secs,
+                        attempt + 1,
+                        max_retries,
+                        body
+                    );
+                    let remaining = self
+                        .token_manager
+                        .report_account_throttled(ctx.id, cooldown);
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(403),
+                        outcome::ACCOUNT_THROTTLED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（账号级临时封锁，凭据 #{} 已冷却 {} 分钟）: {} {}",
+                        api_type,
+                        ctx.id,
+                        cooldown_secs / 60,
+                        status,
+                        body
+                    ));
+                    if remaining == 0 {
+                        anyhow::bail!(
+                            "{} API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。\
+                             上游对凭据 #{} 的账号触发了临时封锁（temporarily suspended / unusual \
+                             user activity）。建议：(1) 增加更多不同 AWS 账号的凭据；\
+                             (2) 降低请求并发，避免触发上游反滥用；\
+                             (3) 在管理面板降低冷却时长或手动解除冷却以重试。原始响应: {} {}",
+                            api_type,
+                            ctx.id,
+                            status,
+                            body
+                        );
+                    }
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,

@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.16] - 2026-06-25
+
+主题：**账号级临时封锁（403 temporarily suspended）按长冷却处理 + 池空报错说人话**。
+
+### 🐛 修复 — 403 临时封锁被误判为连续失败、被自愈反复复活
+
+- 上游反滥用有两种措辞，都是**临时、会自动恢复**：429 `suspicious activity / temporary limits`
+  （已处理），以及 **403 `temporarily suspended / unusual user activity`**（此前**未识别**）。
+- 此前 403 临时封锁走 `report_failure` → 连续 3 次后标 `TooManyFailures` → 被"全员自愈"
+  反复复活 → 持续调度一个正在被风控的账号 → 触发更多 unusual activity、可能延长封锁。
+- 修复：`default_is_account_throttled` 增加 403 措辞识别；provider 的 401/403 分支在落到
+  `report_failure` 前先判账号级风控，命中则走 `report_account_throttled`（复用既有
+  `account_throttle_cooldown_secs`，默认 30 分钟长冷却），冷却期不调度、到期自动回池，
+  **不计入连续失败、不被自愈复活**。受 `account_throttle_failover` 开关控制。
+- 额度耗尽（`QuotaExceeded`）、refresh token 失效（`InvalidRefreshToken`）维持**永久禁用、
+  不自愈**的现状不变。
+
+### 🐛 修复 — 候选池为空时的误导性报错
+
+- 旧报错 `所有凭据均已禁用（6/6）` 自相矛盾（`6/6` 实为"6 个都未禁用"）。池为空的真实
+  原因有三类：disabled / 风控冷却中 / 不匹配本次请求的 model·group。
+- 改为分类报错：`无可调度凭据（共 N：禁用 X / 风控冷却中 Y / 不匹配本次请求模型或分组 Z）
+  ，最近一个约 Ns 后恢复`，便于一眼判断是封号、风控还是模型不支持。
+
 ## [0.6.15] - 2026-06-25
 
 主题：**断流根因修复（流式禁用连接池）+ 调度去 `success_count` 化与 P2C 去羊群 + 监控并入凭据页**。

@@ -1776,9 +1776,40 @@ impl MultiTokenManager {
             }
 
             if candidates.is_empty() {
+                let now = Instant::now();
                 let entries = self.entries.lock();
-                let available = entries.iter().filter(|e| !e.disabled).count();
-                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                // 区分候选池为空的真实原因，避免误报"均已禁用"：
+                // disabled / 风控冷却中 / 不匹配本次请求的 model·group。
+                let mut disabled = 0usize;
+                let mut throttled = 0usize;
+                let mut mismatch = 0usize;
+                let mut soonest_cooldown: Option<u64> = None;
+                for e in entries.iter() {
+                    if e.disabled {
+                        disabled += 1;
+                    } else if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+                        throttled += 1;
+                        let secs = e
+                            .throttled_until
+                            .map(|t| t.saturating_duration_since(now).as_secs())
+                            .unwrap_or(0);
+                        soonest_cooldown =
+                            Some(soonest_cooldown.map_or(secs, |s| s.min(secs)));
+                    } else if !credential_matches_request(&e.credentials, model, group) {
+                        mismatch += 1;
+                    }
+                }
+                let cooldown_hint = soonest_cooldown
+                    .map(|s| format!("，最近一个约 {}s 后恢复", s))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "无可调度凭据（共 {}：禁用 {} / 风控冷却中 {} / 不匹配本次请求模型或分组 {}）{}",
+                    total,
+                    disabled,
+                    throttled,
+                    mismatch,
+                    cooldown_hint
+                );
             };
 
             // balanced 模式:用 Power-of-Two-Choices 打散抢槽顺序,抗高并发羊群
@@ -4439,8 +4470,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("无可调度凭据") && err.contains("禁用 2"),
+            "错误应提示 2 个凭据均被禁用，实际: {}",
             err
         );
     }
@@ -4484,8 +4515,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("无可调度凭据") && err.contains("禁用 2"),
+            "错误应提示 2 个凭据均被禁用，实际: {}",
             err
         );
         assert_eq!(manager.available_count(), 0);
