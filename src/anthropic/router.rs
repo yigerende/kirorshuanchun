@@ -71,6 +71,12 @@ pub fn create_router(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // OpenAI 兼容端点：与 /v1/messages 共用同一 AppState 与 auth_middleware。
+        // 入站归一化成 Anthropic MessagesRequest 后复用全部既有管道（见 crate::openai）。
+        .route(
+            "/chat/completions",
+            post(crate::openai::post_chat_completions),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

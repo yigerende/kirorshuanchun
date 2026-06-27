@@ -24,7 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
-mod handlers;
+pub(crate) mod handlers;
 pub mod middleware;
 mod payload_truncate;
 mod prompt_filter;

@@ -166,20 +166,20 @@ impl TraceUsage {
     }
 }
 
-struct RequestTraceOptions {
-    key_ctx: KeyContext,
-    model: String,
-    is_stream: bool,
-    request_bytes: u64,
-    local_input_tokens: u64,
+pub(crate) struct RequestTraceOptions {
+    pub key_ctx: KeyContext,
+    pub model: String,
+    pub is_stream: bool,
+    pub request_bytes: u64,
+    pub local_input_tokens: u64,
     /// Anthropic→Kiro 转换 + 序列化耗时（毫秒）
-    conversion_ms: Option<u64>,
+    pub conversion_ms: Option<u64>,
     /// 本地 count_all_tokens 耗时（毫秒）
-    token_count_ms: Option<u64>,
+    pub token_count_ms: Option<u64>,
 }
 
 impl RequestTracer {
-    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
+    pub(crate) fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
@@ -296,7 +296,7 @@ impl TraceSink for RequestTracer {
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(match last.as_str() {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
@@ -361,7 +361,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-pub(super) fn map_provider_error(err: Error) -> Response {
+pub(crate) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -459,7 +459,7 @@ fn resolve_usage_input_tokens(
         .unwrap_or(fallback_total_input_tokens)
 }
 
-fn compute_cache_usage_for_key(
+pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
     key_ctx: &KeyContext,
@@ -481,6 +481,127 @@ fn compute_cache_usage_for_key(
     }
 }
 
+/// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。
+///
+/// 这是 Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions` 两条入口的**唯一**
+/// 请求侧真相源——提示词过滤、payload 字节上限裁剪、Anthropic→Kiro 转换（含 tool 配对
+/// 清理）、本地 token 估算、cache 计量全部在此完成，避免两条路径各写一份导致走样。
+pub(crate) struct PreparedKiroRequest {
+    /// 序列化后的 Kiro wire body（直接交给 provider）
+    pub request_body: String,
+    /// 转换 + 序列化耗时（毫秒，落 trace）
+    pub conversion_ms: Option<u64>,
+    /// 本地 count_all_tokens 估算输入 token
+    pub total_input_tokens: i32,
+    /// 本地 count_all_tokens 估算耗时（毫秒，落 trace）
+    pub token_count_ms: Option<u64>,
+    /// 是否启用 thinking（用于出站是否提取 reasoning）
+    pub thinking_enabled: bool,
+    /// 工具名映射（短名 → 原始名），出站还原用
+    pub tool_name_map: std::collections::HashMap<String, String>,
+    /// 本次声明的所有工具名（原始 client 名），`<invoke>` 文本兜底用
+    pub known_tool_names: std::collections::HashSet<String>,
+    /// cache 计量覆盖量（estimate 口径，最终按 total 真值互斥分摊）
+    pub cache_usage: super::cache_metering::CacheUsage,
+}
+
+/// 把（已归一化的）Anthropic `MessagesRequest` 转换并序列化成 Kiro wire body。
+///
+/// 顺序与原 `post_messages` 主体一致：
+/// 1. per-key 提示词过滤（精简 CC / 去边界标记 / 去环境噪音）作用于客户端原始 system；
+/// 2. `convert_within_limit`：在转换前裁最旧历史使转换后 Kiro 体不超上游阈值，转换（含 tool
+///    配对清理）在裁剪后跑，保证输出永远配对合法；
+/// 3. 构造并序列化 `KiroRequest`；
+/// 4. 本地 token 估算 + per-key cache 计量。
+///
+/// `payload` 以 `&mut` 传入因为过滤 / 裁剪会就地改写；调用方在此之后仍可读 `payload.model`
+/// 等字段。返回 `Err` 时调用方应映射为 400（转换失败）或 500（序列化失败）。
+pub(crate) fn prepare_kiro_request(
+    state: &AppState,
+    payload: &mut MessagesRequest,
+    key_ctx: &KeyContext,
+) -> Result<PreparedKiroRequest, Response> {
+    let conversion_started = Instant::now();
+
+    // 1. per-key 提示词过滤（只作用于客户端原始 system，转换器自注入的 prefix 不受影响）
+    super::prompt_filter::apply(&mut payload.system, key_ctx);
+
+    // 2. 转换 + payload 字节上限裁剪
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            let (error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
+                }
+                ConversionError::EmptyMessages => {
+                    ("invalid_request_error", "消息列表为空".to_string())
+                }
+            };
+            tracing::warn!("请求转换失败: {}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response());
+        }
+    };
+
+    // 3. 构造并序列化 Kiro 请求。profile_arn 由 provider 层从真实凭据注入。
+    let kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
+    };
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response());
+        }
+    };
+    let conversion_ms = Some(conversion_started.elapsed().as_millis() as u64);
+
+    // 4. 本地 token 估算 + per-key cache 计量
+    let token_count_started = Instant::now();
+    let total_input_tokens = token::count_all_tokens(
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
+    ) as i32;
+    let token_count_ms = Some(token_count_started.elapsed().as_millis() as u64);
+
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let cache_usage = compute_cache_usage_for_key(state, payload, key_ctx);
+
+    Ok(PreparedKiroRequest {
+        request_body,
+        conversion_ms,
+        total_input_tokens,
+        token_count_ms,
+        thinking_enabled,
+        tool_name_map: conversion_result.tool_name_map,
+        known_tool_names: conversion_result.known_tool_names,
+        cache_usage,
+    })
+}
+
 /// 响应缓存的「写入句柄」：命中 miss 后传入流/非流 handler，待完整响应组装好再 `put`。
 ///
 /// 只在「该请求响应缓存生效」时为 `Some(..)`，否则为 None（handler 内零开销跳过）。
@@ -493,7 +614,7 @@ pub(crate) struct ResponseCacheStore {
 
 impl ResponseCacheStore {
     /// 写入一段干净响应体。`is_sse=true` 表示 body 是 SSE 事件流文本。
-    fn put(&self, body: Vec<u8>, is_sse: bool) {
+    pub(crate) fn put(&self, body: Vec<u8>, is_sse: bool) {
         self.cache
             .put(self.key.clone(), body, is_sse, self.ttl_secs);
     }
@@ -504,7 +625,7 @@ impl ResponseCacheStore {
 /// 返回 `None` 表示缓存未启用（无全局缓存实例，或该 Key 生效配置为关）。
 /// 返回 `Some((cache, key, ttl))` 表示启用：用 `cache.get(&key)` 查、miss 后用 `ttl` 写。
 /// key 在请求转换/裁剪**之前**用原始 payload 计算，使其反映客户端真正发送的内容。
-fn resolve_response_cache(
+pub(crate) fn resolve_response_cache(
     state: &AppState,
     payload: &MessagesRequest,
     key_ctx: &KeyContext,
@@ -520,7 +641,7 @@ fn resolve_response_cache(
 }
 
 /// 命中时构造回放响应：按 `is_sse` 还原 content-type，body 原样写出。
-fn build_cached_response(cached: super::response_cache::CachedResponse) -> Response {
+pub(crate) fn build_cached_response(cached: super::response_cache::CachedResponse) -> Response {
     if cached.is_sse {
         Response::builder()
             .status(StatusCode::OK)
@@ -811,63 +932,19 @@ pub async fn post_messages(
         None => None,
     };
 
-    // 转换请求
-    let conversion_started = Instant::now();
-    // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
-    // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
-    // 追加，不受影响。
-    super::prompt_filter::apply(&mut payload.system, &key_ctx);
-    // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
-    // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
-    let conversion_result = match super::payload_truncate::convert_within_limit(
-        &mut payload,
-        &super::payload_truncate::PayloadLimitConfig::from_env(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
+    // 转换请求（提示词过滤 + 裁剪 + 转换 + 序列化 + token 估算 + cache 计量）。
+    // 与 OpenAI `/v1/chat/completions` 共用同一份 `prepare_kiro_request` 真相源。
+    let prepared = match prepare_kiro_request(&state, &mut payload, &key_ctx) {
+        Ok(p) => p,
+        Err(resp) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return resp;
         }
     };
-
-    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
-    // credentials; additional_model_request_fields is already filtered by converter model support.
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: conversion_result.additional_model_request_fields,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-    // 转换 + 序列化耗时（本地 CPU 开销，落 trace 便于区分"慢在转换 vs 上游"）。
-    let conversion_ms = Some(conversion_started.elapsed().as_millis() as u64);
+    let request_body = prepared.request_body;
+    let conversion_ms = prepared.conversion_ms;
+    let total_input_tokens = prepared.total_input_tokens;
+    let token_count_ms = prepared.token_count_ms;
 
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!(
@@ -875,16 +952,6 @@ pub async fn post_messages(
             crate::kiro::provider::truncate_for_log(&request_body)
         );
     }
-
-    // 估算输入 tokens
-    let token_count_started = Instant::now();
-    let total_input_tokens = token::count_all_tokens(
-        &payload.model,
-        &payload.system,
-        &payload.messages,
-        &payload.tools,
-    ) as i32;
-    let token_count_ms = Some(token_count_started.elapsed().as_millis() as u64);
 
     // 输入 token 分级(仅观测,不限流):small / medium / long。
     // long 请求单独打 info 日志,便于在高并发时段判断大上下文请求占比与分布。
@@ -898,18 +965,14 @@ pub async fn post_messages(
         );
     }
 
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = prepared.thinking_enabled;
 
-    let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
+    let tool_name_map = prepared.tool_name_map;
+    let known_tool_names = prepared.known_tool_names;
 
     // Key 开启时使用中转层增强缓存；关闭时回退到标准 cache_control 口径。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = compute_cache_usage_for_key(&state, &payload, &key_ctx);
+    let cache_usage = prepared.cache_usage;
 
     if payload.stream {
         // 流式响应
