@@ -195,6 +195,28 @@ pub struct Config {
     #[serde(default = "default_cache_meter_capacity")]
     pub cache_meter_capacity: usize,
 
+    /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
+    /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
+    /// 注意：这与 `cache_meter_capacity`（只模拟 token 计量）是两回事，本项缓存真实响应体。
+    #[serde(default)]
+    pub response_cache_enabled: bool,
+
+    /// 响应缓存默认 TTL（秒，默认 180）。可被 per-key 覆盖。
+    #[serde(default = "default_response_cache_ttl_secs")]
+    pub response_cache_ttl_secs: u64,
+
+    /// 响应缓存条目容量上限（默认 1024）。表满按 last_hit LRU 淘汰；运行时 clamp 到 `>= 16`。
+    /// 每条值是一段完整响应体（数十 KB 量级），故默认远小于 cache_meter_capacity。
+    #[serde(default = "default_response_cache_capacity")]
+    pub response_cache_capacity: usize,
+
+    /// 上游凭据配额自动禁用阈值（百分比，默认 90）。仿 kiro-account-manager：
+    /// 每次刷新余额后，若该凭据用量百分比 ≥ 此阈值则自动禁用（reason "配额已满"）；
+    /// 用量回落到阈值以下且此前正是因配额被自动禁用时，自动重新启用。
+    /// 设为 `>= 100` 即关闭自动禁用（仅 remaining≤0 的硬超额仍可手动一键禁用）。
+    #[serde(default = "default_quota_disable_threshold")]
+    pub quota_disable_threshold: f64,
+
     /// 账号并发槽获取是否阻塞等待。默认 false（非阻塞快速失败）。
     ///
     /// false（默认）：所有匹配凭据的并发槽都满时，acquire 立即返回"池忙"，由 provider
@@ -349,6 +371,18 @@ fn default_cache_meter_capacity() -> usize {
     131072
 }
 
+fn default_response_cache_ttl_secs() -> u64 {
+    crate::anthropic::response_cache::DEFAULT_TTL_SECS
+}
+
+fn default_response_cache_capacity() -> usize {
+    crate::anthropic::response_cache::DEFAULT_CAPACITY
+}
+
+fn default_quota_disable_threshold() -> f64 {
+    90.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -388,6 +422,10 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_meter_capacity: default_cache_meter_capacity(),
+            response_cache_enabled: false,
+            response_cache_ttl_secs: default_response_cache_ttl_secs(),
+            response_cache_capacity: default_response_cache_capacity(),
+            quota_disable_threshold: default_quota_disable_threshold(),
             account_acquire_blocking: false,
             usage_gated_streaming_enabled: default_usage_gated_streaming_enabled(),
             stream_conn_reuse_enabled: false,

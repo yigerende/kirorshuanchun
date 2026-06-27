@@ -61,6 +61,13 @@ pub struct ClientKey {
     /// 提示词过滤（per-key，默认关）：去环境噪音（删 # Environment 段、gitStatus 等行）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_env_noise: bool,
+    /// 响应缓存 per-key 覆盖（None = 跟随全局 `responseCacheEnabled`；Some(true/false) = 强制开/关）。
+    /// 老数据无此字段时为 None（跟随全局，行为不变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 TTL per-key 覆盖（秒；None 或 0 = 跟随全局 `responseCacheTtlSecs`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -227,6 +234,8 @@ impl ClientKeyManager {
             simplify_cc_prompt: false,
             strip_boundary_markers: false,
             strip_env_noise: false,
+            response_cache_enabled: None,
+            response_cache_ttl_secs: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -304,6 +313,8 @@ impl ClientKeyManager {
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
+                    response_cache_enabled: None,
+                    response_cache_ttl_secs: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -359,6 +370,8 @@ impl ClientKeyManager {
         simplify_cc_prompt: Option<bool>,
         strip_boundary_markers: Option<bool>,
         strip_env_noise: Option<bool>,
+        response_cache_enabled: Option<Option<bool>>,
+        response_cache_ttl_secs: Option<Option<u32>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -383,6 +396,13 @@ impl ClientKeyManager {
                 }
                 if let Some(v) = strip_env_noise {
                     e.strip_env_noise = v;
+                }
+                if let Some(v) = response_cache_enabled {
+                    e.response_cache_enabled = v;
+                }
+                if let Some(v) = response_cache_ttl_secs {
+                    // 0 视为"清除覆盖、跟随全局"
+                    e.response_cache_ttl_secs = v.filter(|t| *t > 0);
                 }
                 true
             }
@@ -411,6 +431,17 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| e.cache_enabled)
             .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 的响应缓存覆盖 `(enabled_override, ttl_secs_override)`。
+    /// 两者均为 None 表示「跟随全局配置」。Key 不存在时返回 (None, None)。
+    pub fn response_cache_cfg_of(&self, id: u64) -> (Option<bool>, Option<u32>) {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| (e.response_cache_enabled, e.response_cache_ttl_secs))
+            .unwrap_or((None, None))
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -688,8 +719,55 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None, false);
         assert!(!mgr.cache_enabled_of(entry.id));
-        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None, None, None));
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None
+        ));
         assert!(mgr.cache_enabled_of(entry.id));
+    }
+
+    #[test]
+    fn response_cache_override_can_be_updated() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None, false);
+        // 默认无覆盖
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (None, None));
+        // 设置覆盖：开启 + ttl 60
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(true)),
+            Some(Some(60)),
+        ));
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
+        // ttl=0 → 清除 ttl 覆盖（跟随全局）
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(0)),
+        ));
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
     }
 
     #[test]

@@ -169,6 +169,8 @@ mod tests {
             simplify_cc_prompt: cc,
             strip_boundary_markers: boundary,
             strip_env_noise: env,
+            response_cache_enabled: None,
+            response_cache_ttl_secs: None,
             key_source: TraceKeySource::ClientKey,
         }
     }

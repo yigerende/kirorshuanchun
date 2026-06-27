@@ -727,7 +727,10 @@ fn extract_standard_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment
 ///   2. 退回客户端 Key id —— 至少保证不同客户端 Key 之间隔离。
 ///
 /// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
-fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
+///
+/// `pub(crate)`：响应缓存（`response_cache`）复用同一套会话隔离口径构造缓存键，
+/// 保证「prompt 计量」与「响应体缓存」对会话/Key 的隔离边界完全一致。
+pub(crate) fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
     if let Some(session) = req
         .metadata
         .as_ref()

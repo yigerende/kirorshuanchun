@@ -267,6 +267,18 @@ async fn main() {
     ));
     cache_meter.clone().spawn_background();
 
+    // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。仅在全局开关开启时构造并启动
+    // 后台清理；关闭时为 None（per-key Some(true) 覆盖在全局关闭时不生效，避免无谓内存占用）。
+    let response_cache = if config.response_cache_enabled {
+        let rc = std::sync::Arc::new(anthropic::response_cache::ResponseCache::new(
+            config.response_cache_capacity,
+        ));
+        rc.clone().spawn_background();
+        Some(rc)
+    } else {
+        None
+    };
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -276,6 +288,9 @@ async fn main() {
         Some(cache_meter.clone()),
         trace_store.clone(),
         config.usage_gated_streaming_enabled,
+        response_cache,
+        config.response_cache_enabled,
+        config.response_cache_ttl_secs,
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

@@ -949,6 +949,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         simplify_cc_prompt: k.simplify_cc_prompt,
         strip_boundary_markers: k.strip_boundary_markers,
         strip_env_noise: k.strip_env_noise,
+        response_cache_enabled: k.response_cache_enabled,
+        response_cache_ttl_secs: k.response_cache_ttl_secs,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1059,6 +1061,8 @@ pub async fn update_client_key(
             payload.simplify_cc_prompt,
             payload.strip_boundary_markers,
             payload.strip_env_noise,
+            payload.response_cache_enabled.map(Some),
+            payload.response_cache_ttl_secs.map(Some),
         )
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()

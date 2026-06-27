@@ -774,6 +774,12 @@ pub struct ClientKeyItem {
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
     pub strip_env_noise: bool,
+    /// 响应缓存开关覆盖（None = 跟随全局 `responseCacheEnabled`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 TTL 覆盖（秒；None = 跟随全局）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -829,6 +835,12 @@ pub struct UpdateClientKeyRequest {
     pub strip_boundary_markers: Option<bool>,
     #[serde(default)]
     pub strip_env_noise: Option<bool>,
+    /// 响应缓存开关覆盖更新（字段缺省=不变更；值为 true/false=强制开/关该 Key 的响应缓存）。
+    #[serde(default)]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 TTL 覆盖更新（秒；字段缺省=不变更；0=清除覆盖、跟随全局）。
+    #[serde(default)]
+    pub response_cache_ttl_secs: Option<u32>,
 }
 
 fn default_client_key_cache_enabled() -> bool {

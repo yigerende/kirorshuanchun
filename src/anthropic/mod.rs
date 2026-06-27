@@ -28,6 +28,7 @@ mod handlers;
 pub mod middleware;
 mod payload_truncate;
 mod prompt_filter;
+pub mod response_cache;
 mod router;
 pub mod stream;
 pub mod types;

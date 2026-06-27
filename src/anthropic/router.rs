@@ -16,6 +16,7 @@ use super::{
     cache_metering::SharedCacheMeter,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    response_cache::SharedResponseCache,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -38,6 +39,9 @@ pub fn create_router_with_provider(
         None,
         None,
         true,
+        None,
+        false,
+        super::response_cache::DEFAULT_TTL_SECS,
     )
 }
 
@@ -52,6 +56,9 @@ pub fn create_router(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     usage_gated_streaming: bool,
+    response_cache: Option<SharedResponseCache>,
+    response_cache_default_enabled: bool,
+    response_cache_default_ttl_secs: u64,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -59,6 +66,11 @@ pub fn create_router(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
+    state = state.with_response_cache(
+        response_cache,
+        response_cache_default_enabled,
+        response_cache_default_ttl_secs,
+    );
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);
 

@@ -481,6 +481,67 @@ fn compute_cache_usage_for_key(
     }
 }
 
+/// 响应缓存的「写入句柄」：命中 miss 后传入流/非流 handler，待完整响应组装好再 `put`。
+///
+/// 只在「该请求响应缓存生效」时为 `Some(..)`，否则为 None（handler 内零开销跳过）。
+#[derive(Clone)]
+pub(crate) struct ResponseCacheStore {
+    cache: super::response_cache::SharedResponseCache,
+    key: String,
+    ttl_secs: u64,
+}
+
+impl ResponseCacheStore {
+    /// 写入一段干净响应体。`is_sse=true` 表示 body 是 SSE 事件流文本。
+    fn put(&self, body: Vec<u8>, is_sse: bool) {
+        self.cache
+            .put(self.key.clone(), body, is_sse, self.ttl_secs);
+    }
+}
+
+/// 解析「该请求是否启用响应缓存」并构造 lookup/store 所需上下文。
+///
+/// 返回 `None` 表示缓存未启用（无全局缓存实例，或该 Key 生效配置为关）。
+/// 返回 `Some((cache, key, ttl))` 表示启用：用 `cache.get(&key)` 查、miss 后用 `ttl` 写。
+/// key 在请求转换/裁剪**之前**用原始 payload 计算，使其反映客户端真正发送的内容。
+fn resolve_response_cache(
+    state: &AppState,
+    payload: &MessagesRequest,
+    key_ctx: &KeyContext,
+) -> Option<(super::response_cache::SharedResponseCache, String, u64)> {
+    let cache = state.response_cache.as_ref()?;
+    let (enabled, ttl) = super::response_cache::effective_cache_config(
+        key_ctx.response_cache_enabled,
+        key_ctx.response_cache_ttl_secs,
+        state.response_cache_default_enabled,
+        state.response_cache_default_ttl_secs,
+    );
+    if !enabled {
+        return None;
+    }
+    let key = super::response_cache::ResponseCache::compute_key(payload, key_ctx.key_id);
+    Some((cache.clone(), key, ttl))
+}
+
+/// 命中时构造回放响应：按 `is_sse` 还原 content-type，body 原样写出。
+fn build_cached_response(cached: super::response_cache::CachedResponse) -> Response {
+    if cached.is_sse {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from(cached.body))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(cached.body))
+            .unwrap()
+    }
+}
+
 fn available_models() -> Vec<Model> {
     vec![
         Model {
@@ -732,6 +793,28 @@ pub async fn post_messages(
         .await;
     }
 
+    // 响应缓存：在转换/裁剪前用原始 payload 计算键并查表。命中即回放、跳过上游。
+    // 注：/v1 live 流式路径暂不写入缓存（见下文 handle_stream_request），但命中仍可回放
+    //（缓存可能由 /cc 路径写入；键只按会话+内容，不分端点）。
+    let response_cache_store =
+        resolve_response_cache(&state, &payload, &key_ctx).map(|(cache, key, ttl)| {
+            if let Some(cached) = cache.get(&key) {
+                tracing::debug!(key = %&key[..16.min(key.len())], "响应缓存命中 (/v1)");
+                hook.record(0, 0, 0, 0, 0, 0.0, "cache_hit");
+                return Err(build_cached_response(cached));
+            }
+            Ok(ResponseCacheStore {
+                cache,
+                key,
+                ttl_secs: ttl,
+            })
+        });
+    let response_cache_store = match response_cache_store {
+        Some(Err(resp)) => return resp,
+        Some(Ok(store)) => Some(store),
+        None => None,
+    };
+
     // 转换请求
     let conversion_started = Instant::now();
     // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
@@ -887,6 +970,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1131,6 +1215,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1367,6 +1452,18 @@ async fn handle_non_stream_request(
             context_input_tokens: context_input_tokens.map(|v| v.max(0) as u64),
         },
     );
+    // 响应缓存写入：只缓存「干净的终态文本响应」——无 tool_use、stop_reason 为 end_turn。
+    // tool_use 响应带 tool_use_id，跨会话回放会污染配对；非 end_turn（max_tokens /
+    // 上下文超限）是被截断的非自洽响应，均不缓存。
+    if let Some(store) = &response_cache_store {
+        if !has_tool_use && stop_reason == "end_turn" {
+            if let Ok(bytes) = serde_json::to_vec(&response_body) {
+                store.put(bytes, false);
+                tracing::debug!("响应缓存写入 (非流式)");
+            }
+        }
+    }
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1573,6 +1670,27 @@ pub async fn post_messages_cc(
         .await;
     }
 
+    // 响应缓存：在转换/裁剪前用原始 payload 计算键并查表。命中即回放、跳过上游。
+    // /cc 路径（流式 + 非流式）既查也写。
+    let response_cache_store =
+        resolve_response_cache(&state, &payload, &key_ctx).map(|(cache, key, ttl)| {
+            if let Some(cached) = cache.get(&key) {
+                tracing::debug!(key = %&key[..16.min(key.len())], "响应缓存命中 (/cc)");
+                hook.record(0, 0, 0, 0, 0, 0.0, "cache_hit");
+                return Err(build_cached_response(cached));
+            }
+            Ok(ResponseCacheStore {
+                cache,
+                key,
+                ttl_secs: ttl,
+            })
+        });
+    let response_cache_store = match response_cache_store {
+        Some(Err(resp)) => return resp,
+        Some(Ok(store)) => Some(store),
+        None => None,
+    };
+
     // 转换请求
     let conversion_started = Instant::now();
     // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
@@ -1700,6 +1818,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 tracer,
                 key_ctx.group.clone(),
+                response_cache_store,
             )
             .await
         } else {
@@ -1716,6 +1835,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 tracer,
                 key_ctx.group.clone(),
+                response_cache_store,
             )
             .await
         }
@@ -1746,6 +1866,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1767,6 +1888,7 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1800,7 +1922,14 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        hook,
+        credential_id,
+        tracer,
+        response_cache_store,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1825,6 +1954,7 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1839,8 +1969,9 @@ fn create_buffered_sse_stream(
             credential_id,
             tracer,
             0u64,
+            response_cache_store,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, response_cache_store)| async move {
             if finished {
                 return None;
             }
@@ -1855,7 +1986,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                     }
 
                     // 然后处理数据流
@@ -1909,7 +2040,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1934,10 +2065,22 @@ fn create_buffered_sse_stream(
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
+                                    .iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                // 响应缓存写入：只缓存干净的 end_turn 文本响应（无 tool_use、未截断）。
+                                // get_stop_reason() 在出现 tool_use 时返回 "tool_use"，故此判定已隐含排除工具调用。
+                                if let Some(store) = &response_cache_store {
+                                    if ctx.stop_reason() == "end_turn" {
+                                        let sse_text: Vec<u8> = all_events
+                                            .iter()
+                                            .flat_map(|e| e.to_sse_string().into_bytes())
+                                            .collect();
+                                        store.put(sse_text, true);
+                                        tracing::debug!("响应缓存写入 (缓冲流式)");
+                                    }
+                                }
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                             }
                         }
                     }
@@ -1967,6 +2110,7 @@ async fn handle_stream_request_gated(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     let call_result = match provider
         .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1995,7 +2139,7 @@ async fn handle_stream_request_gated(
     );
     ctx.set_cache_usage(cache_usage);
 
-    let stream = create_gated_sse_stream(call_result, ctx, hook, tracer);
+    let stream = create_gated_sse_stream(call_result, ctx, hook, tracer, response_cache_store);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -2033,6 +2177,7 @@ fn create_gated_sse_stream(
     ctx: GatedStreamContext,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let credential_id = call_result.credential_id;
     let crate::kiro::provider::KiroCallResult {
@@ -2043,8 +2188,8 @@ fn create_gated_sse_stream(
     let body_stream = response.bytes_stream();
 
     stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, account_guard),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, account_guard)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, account_guard, response_cache_store, Vec::<u8>::new()),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, account_guard, response_cache_store, mut cache_accum)| async move {
             if finished {
                 return None;
             }
@@ -2074,21 +2219,27 @@ fn create_gated_sse_stream(
                                 }
                             }
 
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 累积已下发的 SSE 字节（供响应缓存写入；ping 不计入）。
+                            let mut bytes: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(events.len());
+                            for e in &events {
+                                let s = e.to_sse_string();
+                                if response_cache_store.is_some() {
+                                    cache_accum.extend_from_slice(s.as_bytes());
+                                }
+                                bytes.push(Ok(Bytes::from(s)));
+                            }
 
                             // 首个非空批次 = 放闸时刻 = 下游真正开始吐字（buffering_delay 由此算出）。
                             if !bytes.is_empty() {
                                 tracer.mark_downstream_first_event();
                             }
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游断流：finish 把剩余（含未放闸时的 message_start+缓冲）吐出，记 interrupted。
+                            // 断流是非自洽响应，不写入缓存。
                             let final_events = ctx.finish();
                             let (i, o, cc, cr, credits) = ctx.final_usage();
                             hook.record(credential_id, i, o, cc, cr, credits, "error");
@@ -2104,7 +2255,7 @@ fn create_gated_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                         None => {
                             // 流正常结束：finish 生成 message_delta/message_stop（必要时先放闸）。
@@ -2113,18 +2264,29 @@ fn create_gated_sse_stream(
                             hook.record(credential_id, i, o, cc, cr, credits, "success");
                             tracer.mark_downstream_first_event();
                             tracer.finalize("success", None, None, None, gated_trace_usage(&ctx));
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            let mut bytes: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(final_events.len());
+                            for e in &final_events {
+                                let s = e.to_sse_string();
+                                if response_cache_store.is_some() {
+                                    cache_accum.extend_from_slice(s.as_bytes());
+                                }
+                                bytes.push(Ok(Bytes::from(s)));
+                            }
+                            // 响应缓存写入：只缓存干净的 end_turn 文本响应（无 tool_use、未截断）。
+                            if let Some(store) = &response_cache_store {
+                                if ctx.stop_reason() == "end_turn" {
+                                    store.put(std::mem::take(&mut cache_accum), true);
+                                    tracing::debug!("响应缓存写入 (gated 流式)");
+                                }
+                            }
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                     }
                 }
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件（gated 模式）");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                 }
             }
         },

@@ -2314,9 +2314,13 @@ impl BufferedStreamContext {
     pub fn context_input_tokens(&self) -> Option<i32> {
         self.inner.context_input_tokens
     }
-}
 
-/// usage-gated 流式上下文（A1：`/cc/v1` 首包优化）。
+    /// 当前响应的最终 stop_reason（`end_turn` / `tool_use` / `max_tokens` /
+    /// `model_context_window_exceeded` 等）。响应缓存据此判定是否可缓存（只缓存 `end_turn`）。
+    pub fn stop_reason(&self) -> String {
+        self.inner.state_manager.get_stop_reason()
+    }
+}
 ///
 /// 与 [`BufferedStreamContext`]（全缓冲，等整条上游流结束才一次性发）不同：本上下文只
 /// 缓冲到**能确定 `message_start.usage.input_tokens` 的那一刻**就放闸（"开门"），之后边收
@@ -2471,6 +2475,11 @@ impl GatedStreamContext {
     /// 上游 contextUsage 折算的输入 token（无 contextUsageEvent 时为 None），用于 trace 落库。
     pub fn context_input_tokens(&self) -> Option<i32> {
         self.inner.context_input_tokens
+    }
+
+    /// 当前响应的最终 stop_reason。响应缓存据此判定是否可缓存（只缓存 `end_turn`）。
+    pub fn stop_reason(&self) -> String {
+        self.inner.state_manager.get_stop_reason()
     }
 }
 
