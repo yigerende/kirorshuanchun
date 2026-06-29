@@ -2187,9 +2187,10 @@ impl AdminService {
             && req.response_cache_enabled.is_none()
             && req.response_cache_ttl_secs.is_none()
             && req.cache_read_ratio.is_none()
+            && req.cache_meter_ttl_secs.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
                     .to_string(),
             ));
         }
