@@ -170,6 +170,8 @@ async fn main() {
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
+        config.preferred_endpoint.clone(),
+        config.endpoint_fallback,
     );
 
     // 初始化 count_tokens 配置
