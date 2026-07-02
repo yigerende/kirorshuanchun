@@ -173,6 +173,13 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub scopes: Option<String>,
 
+    /// 账号级 userId（KAM 导出携带，形如
+    /// `https://login.microsoftonline.com/<tenant>/v2.0.<oid>`）。当 external_idp
+    /// 账号缺 tokenEndpoint/issuerUrl/scopes 时，据此派生这三者（见
+    /// `derive_external_idp_endpoints`）。仅作派生输入，不落库。
+    #[serde(default)]
+    pub user_id: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,

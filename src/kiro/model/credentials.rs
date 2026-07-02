@@ -523,6 +523,96 @@ pub fn external_idp_host(region: &str) -> String {
     }
 }
 
+/// external_idp 端点白名单主机后缀（SSRF 防护）。
+///
+/// 只有 Microsoft / Entra（Azure AD）的登录主机族允许作为刷新端点，避免把任意
+/// issuer 当作 token 端点访问。对齐 Kiro-Go `allowedExternalIdpIssuerSuffixes`。
+const ALLOWED_EXTERNAL_IDP_HOST_SUFFIXES: [&str; 3] = [
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 判断主机是否落在 external_idp 白名单内（大小写不敏感，忽略端口）。
+fn is_allowed_external_idp_host(host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    ALLOWED_EXTERNAL_IDP_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+}
+
+/// 从形如 `https://<host>/<tenant>/...` 的 URL 解析出 (host, tenant)。
+///
+/// 强制 https；host 必须落在白名单内（拒绝 IP 字面量与非 Microsoft 主机）；
+/// tenant 取路径首段。任一条件不满足返回 `None`。
+fn parse_ms_tenant(src: &str) -> Option<(String, String)> {
+    let rest = src.trim().strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    if !is_allowed_external_idp_host(host) {
+        return None;
+    }
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let tenant = path.split('/').next()?.trim();
+    if tenant.is_empty() {
+        return None;
+    }
+    Some((host, tenant.to_string()))
+}
+
+/// 从 JWT access_token 解出 `iss`（issuer）claim。解析失败返回 `None`，不做签名校验。
+fn jwt_iss(access_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload_b64 = access_token.trim().split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// 为 KAM 导出的 external_idp 账号派生 `tokenEndpoint` / `issuerUrl` / `scopes`。
+///
+/// KAM 导出的企业 SSO（Azure AD / Entra）账号通常只带 `clientId` + `refreshToken`
+/// + 账号级 `userId`，缺 `tokenEndpoint`/`issuerUrl`/`scopes`；而 external_idp 刷新
+/// （见 [`refresh_external_idp_token`](crate::kiro::token_manager)）硬要求
+/// `tokenEndpoint`。本函数据此重建（对齐 Kiro-Go `DeriveExternalIdpEndpoints`）。
+///
+/// 租户来源：优先 `userId`（形如 `https://login.microsoftonline.com/<tenant>/v2.0.<oid>`），
+/// 缺失时回落到 `accessToken` JWT 的 `iss` claim。二者都拿不到可用租户即返回 `None`，
+/// 调用方回落原有「需要 clientId 和 tokenEndpoint」报错。
+///
+/// - `tokenEndpoint` = `https://<host>/<tenant>/oauth2/v2.0/token`
+/// - `issuerUrl`     = `https://<host>/<tenant>/v2.0`
+/// - `scopes`        = `api://<clientId>/codewhisperer:conversations api://<clientId>/codewhisperer:completions offline_access`
+///   （`clientId` 缺失时为空串）
+///
+/// host 经白名单校验（`.microsoftonline.com/.us/.cn`），非白名单主机返回 `None`（SSRF 防护）。
+pub fn derive_external_idp_endpoints(
+    user_id: Option<&str>,
+    access_token: Option<&str>,
+    client_id: Option<&str>,
+) -> Option<(String, String, String)> {
+    let src = user_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| access_token.and_then(jwt_iss))?;
+    let (host, tenant) = parse_ms_tenant(&src)?;
+    let token_endpoint = format!("https://{}/{}/oauth2/v2.0/token", host, tenant);
+    let issuer_url = format!("https://{}/{}/v2.0", host, tenant);
+    let scopes = match client_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(cid) => format!(
+            "api://{cid}/codewhisperer:conversations \
+             api://{cid}/codewhisperer:completions offline_access"
+        ),
+        None => String::new(),
+    };
+    Some((token_endpoint, issuer_url, scopes))
+}
+
 #[cfg(test)]
 impl KiroCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
@@ -679,6 +769,89 @@ mod tests {
             external_idp_host("ap-southeast-1"),
             "q.ap-southeast-1.amazonaws.com"
         );
+    }
+
+    #[test]
+    fn test_derive_external_idp_from_user_id() {
+        // 标准 KAM userId：https://login.microsoftonline.com/<tenant>/v2.0.<oid>
+        let user_id =
+            "https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/v2.0.abc";
+        let (token_endpoint, issuer_url, scopes) =
+            derive_external_idp_endpoints(Some(user_id), None, Some("client-xyz"))
+                .expect("应从 userId 派生出端点");
+        assert_eq!(
+            token_endpoint,
+            "https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/oauth2/v2.0/token"
+        );
+        assert_eq!(
+            issuer_url,
+            "https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/v2.0"
+        );
+        assert_eq!(
+            scopes,
+            "api://client-xyz/codewhisperer:conversations \
+             api://client-xyz/codewhisperer:completions offline_access"
+        );
+    }
+
+    #[test]
+    fn test_derive_external_idp_scopes_empty_without_client_id() {
+        let user_id = "https://login.microsoftonline.com/tenant-1/v2.0.oid";
+        let (_, _, scopes) = derive_external_idp_endpoints(Some(user_id), None, None)
+            .expect("clientId 缺失也应派生出端点");
+        assert_eq!(scopes, "");
+    }
+
+    #[test]
+    fn test_derive_external_idp_rejects_non_whitelisted_host() {
+        // 非 Microsoft 主机 → 拒绝（SSRF 防护）
+        assert!(derive_external_idp_endpoints(
+            Some("https://evil.example.com/tenant/v2.0.oid"),
+            None,
+            Some("c")
+        )
+        .is_none());
+        // IP 字面量 → 拒绝
+        assert!(derive_external_idp_endpoints(
+            Some("https://127.0.0.1/tenant/v2.0"),
+            None,
+            Some("c")
+        )
+        .is_none());
+        // 非 https → 拒绝
+        assert!(derive_external_idp_endpoints(
+            Some("http://login.microsoftonline.com/tenant/v2.0"),
+            None,
+            Some("c")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_derive_external_idp_fallback_to_jwt_iss() {
+        // userId 缺失 → 从 accessToken JWT 的 iss 兜底。
+        // 构造一个 payload 为 {"iss":"https://login.microsoftonline.com/tenant-jwt/v2.0"} 的假 JWT。
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "iss": "https://login.microsoftonline.com/tenant-jwt/v2.0"
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let fake_jwt = format!("header.{}.sig", payload_b64);
+        let (token_endpoint, _, _) =
+            derive_external_idp_endpoints(None, Some(&fake_jwt), Some("c"))
+                .expect("应从 JWT iss 派生出端点");
+        assert_eq!(
+            token_endpoint,
+            "https://login.microsoftonline.com/tenant-jwt/oauth2/v2.0/token"
+        );
+    }
+
+    #[test]
+    fn test_derive_external_idp_none_when_no_source() {
+        // 既无 userId 也无可解析的 accessToken → None
+        assert!(derive_external_idp_endpoints(None, None, Some("c")).is_none());
+        assert!(derive_external_idp_endpoints(Some("   "), Some("not-a-jwt"), Some("c")).is_none());
     }
 
     #[test]

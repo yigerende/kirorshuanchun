@@ -1238,6 +1238,35 @@ impl AdminService {
             }
         }
 
+        // external_idp 端点派生：KAM 导出的企业 SSO（Azure AD / Entra）账号常只带
+        // clientId + refreshToken + 账号级 userId，缺 tokenEndpoint/issuerUrl/scopes，
+        // 而 external_idp 刷新硬要求 tokenEndpoint。此处从 userId（或 accessToken JWT
+        // 的 iss）派生出这三项（对齐 Kiro-Go DeriveExternalIdpEndpoints）。
+        // 仅在 external_idp 且 tokenEndpoint 缺失时触发；已带端点的完整导入原样保留。
+        let is_external_idp = {
+            let norm = req.auth_method.replace('-', "_");
+            norm.eq_ignore_ascii_case("external_idp") || norm.eq_ignore_ascii_case("externalidp")
+        };
+        let (mut token_endpoint, mut issuer_url, mut scopes) =
+            (req.token_endpoint, req.issuer_url, req.scopes);
+        if is_external_idp && token_endpoint.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some((ep, iss, sc)) =
+                crate::kiro::model::credentials::derive_external_idp_endpoints(
+                    req.user_id.as_deref(),
+                    req.access_token.as_deref(),
+                    req.client_id.as_deref(),
+                )
+            {
+                token_endpoint = Some(ep);
+                if issuer_url.as_deref().unwrap_or("").trim().is_empty() {
+                    issuer_url = Some(iss);
+                }
+                if scopes.as_deref().unwrap_or("").trim().is_empty() && !sc.is_empty() {
+                    scopes = Some(sc);
+                }
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1251,9 +1280,9 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             start_url: req.start_url,
-            token_endpoint: req.token_endpoint,
-            issuer_url: req.issuer_url,
-            scopes: req.scopes,
+            token_endpoint,
+            issuer_url,
+            scopes,
             priority: req.priority,
             max_concurrency: None,
             region: req.region,

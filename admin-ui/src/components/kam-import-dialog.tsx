@@ -401,11 +401,18 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
         const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+        const accessToken = cred.accessToken?.trim() || undefined
+        // 账号级 userId（KAM 导出形如 https://login.microsoftonline.com/<tenant>/v2.0.<oid>）
+        // 承载 Azure 租户，后端据此派生 tokenEndpoint/issuerUrl/scopes。
+        const userId = typeof account.userId === 'string' ? account.userId.trim() || undefined : undefined
         const rawAuthMethod = cred.authMethod?.trim()
-        const authMethod = tokenEndpoint
-          ? 'external_idp'
-          : rawAuthMethod
-            ? rawAuthMethod
+        // authMethod 归一化：显式 authMethod 优先（KAM 企业 SSO 导出即便缺 tokenEndpoint
+        // 也标 external_idp）；否则有 tokenEndpoint 视为 external_idp；再否则按 clientId+secret
+        // 判 idc；兜底 social。
+        const authMethod = rawAuthMethod
+          ? rawAuthMethod
+          : tokenEndpoint
+            ? 'external_idp'
             : clientId && clientSecret
               ? 'idc'
               : 'social'
@@ -416,9 +423,18 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
           continue
         }
-        if (authMethod.toLowerCase() === 'external_idp' && (!clientId || !tokenEndpoint)) {
-          updateResult(i, { status: 'failed', error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint' })
-          continue
+        // external_idp：clientId 必需；tokenEndpoint 可缺失——只要能从 userId 或
+        // accessToken(JWT iss) 派生出 Azure 租户即可（后端 derive_external_idp_endpoints
+        // 会重建端点并做主机白名单校验）。三者皆无才判失败。
+        if (authMethod.toLowerCase() === 'external_idp') {
+          if (!clientId) {
+            updateResult(i, { status: 'failed', error: 'external_idp 模式需要 clientId' })
+            continue
+          }
+          if (!tokenEndpoint && !userId && !accessToken) {
+            updateResult(i, { status: 'failed', error: 'external_idp 模式需要 tokenEndpoint，或可派生端点的 userId / accessToken' })
+            continue
+          }
         }
 
         // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
@@ -430,7 +446,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           index: i,
           req: {
             refreshToken: token,
-            accessToken: cred.accessToken?.trim() || undefined,
+            accessToken,
             profileArn: cred.profileArn?.trim() || undefined,
             expiresAt: normalizeExpiresAt(cred.expiresAt),
             authMethod,
@@ -442,6 +458,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             scopes: cred.scopes?.trim() || undefined,
             clientId,
             clientSecret,
+            userId,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,

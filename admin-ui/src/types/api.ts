@@ -133,6 +133,7 @@ export interface AddCredentialRequest {
   tokenEndpoint?: string
   issuerUrl?: string
   scopes?: string
+  userId?: string
   priority?: number
   authRegion?: string
   apiRegion?: string
