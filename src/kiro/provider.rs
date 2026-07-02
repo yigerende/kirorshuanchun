@@ -14,6 +14,10 @@ use tokio::time::sleep;
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME;
+use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+use crate::kiro::endpoint::codewhisperer::CODEWHISPERER_ENDPOINT_NAME;
+use crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
@@ -136,6 +140,10 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// Preferred endpoint when route-level fallback is enabled.
+    preferred_endpoint: Option<String>,
+    /// Whether to try Kiro-Go-compatible fallback endpoints on the same credential.
+    endpoint_fallback: bool,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -157,12 +165,21 @@ impl KiroProvider {
         proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
+        preferred_endpoint: Option<String>,
+        endpoint_fallback: bool,
     ) -> Self {
         assert!(
             endpoints.contains_key(&default_endpoint),
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
+        if let Some(preferred) = preferred_endpoint.as_deref() {
+            assert!(
+                endpoints.contains_key(preferred),
+                "preferred endpoint {} 未在 endpoints 注册表中",
+                preferred
+            );
+        }
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let initial_client =
@@ -182,6 +199,8 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            preferred_endpoint,
+            endpoint_fallback,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -221,6 +240,57 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// Build endpoint order for API calls. When endpoint fallback is disabled,
+    /// returns the single selected endpoint; when enabled, primary first then the
+    /// remaining Kiro-Go-compatible streaming endpoints.
+    fn endpoint_order_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
+        let primary = credentials
+            .endpoint
+            .as_deref()
+            .or(self.preferred_endpoint.as_deref())
+            .unwrap_or(&self.default_endpoint);
+        if !self.endpoint_fallback || primary == CLI_ENDPOINT_NAME {
+            return self.endpoints.get(primary).cloned()
+                .map(|endpoint| vec![endpoint])
+                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", primary));
+        }
+        const FALLBACK_ORDER: [&str; 3] = [
+            IDE_ENDPOINT_NAME,
+            CODEWHISPERER_ENDPOINT_NAME,
+            AMAZONQ_ENDPOINT_NAME,
+        ];
+        if !FALLBACK_ORDER.contains(&primary) {
+            return self.endpoints.get(primary).cloned()
+                .map(|endpoint| vec![endpoint])
+                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", primary));
+        }
+        let mut names = Vec::with_capacity(3);
+        names.push(primary);
+        for name in FALLBACK_ORDER {
+            if name != primary {
+                names.push(name);
+            }
+        }
+        names.into_iter().map(|name| {
+            self.endpoints.get(name).cloned()
+                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+        }).collect()
+    }
+
+    fn is_fallbackable_status(status: reqwest::StatusCode) -> bool {
+        // 对齐 Kiro-Go (proxy/kiro.go:401-419): 除账号级状态(401/402/403)外,
+        // 其余非 200 一律 fallback 到下一个端点(含 524 网关超时、400 客户端校验错误)。
+        // 401/403/402 由下方账号级状态处理分支负责,在同一账号上换端点无意义。
+        !matches!(status.as_u16(), 401 | 402 | 403)
+    }
+
+    fn is_fallbackable_network_error() -> bool {
+        true
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -537,121 +607,89 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            let endpoints = match self.endpoint_order_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        "",
-                        None,
-                        outcome::UNKNOWN,
-                        Some(&e.to_string()),
-                        attempt_start,
-                    );
+                    Self::emit_attempt(sink, attempt, ctx.id, "", None, outcome::UNKNOWN, Some(&e.to_string()), attempt_start);
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
                     continue;
                 }
             };
-            let endpoint_name = endpoint.name();
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config,
-            };
-
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
-
-            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
-            }
-
-            // 流式请求默认用禁用连接复用的专用 Client(每条流新连接,杜绝长流被上游
-            // 中途掐断的"断流");非流式走复用连接的 Client,保留首 token 优化。
-            // 全局 stream_conn_reuse_enabled=true 时流式也复用连接池(省每请求新 TLS 握手
-            // ~100-200ms,代价是可能偶发断流):复用走 client_for(pool_idle=15s < ALB 60s,
-            // 陈旧连接复用前先淘汰;取连接竞态由 execute 失败重试兜底——仅首字节前可重试)。
             let stream_reuse = config.stream_conn_reuse_enabled;
-            let http_client = if is_stream && !stream_reuse {
-                self.streaming_client_for(&ctx.credentials)?
+            let http_client = match if is_stream && !stream_reuse {
+                self.streaming_client_for(&ctx.credentials)
             } else {
-                self.client_for(&ctx.credentials)?
-            };
-
-            let base = http_client
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type());
-            let request = endpoint.decorate_api(base, &rctx);
-
-            // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
-            let request = request
-                .build()
-                .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
-                }
-            }
-            let response = match http_client.execute(request).await {
-                Ok(resp) => resp,
+                self.client_for(&ctx.credentials)
+            } {
+                Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        endpoint_name,
-                        None,
-                        outcome::NETWORK_ERROR,
-                        Some(&e.to_string()),
-                        attempt_start,
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
+                    Self::emit_attempt(sink, attempt, ctx.id, "", None, outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start);
+                    last_error = Some(e);
+                    if attempt + 1 < max_retries { sleep(Self::retry_delay(attempt)).await; }
                     continue;
                 }
             };
 
-            let status = response.status();
+            let endpoint_count = endpoints.len();
+            let mut selected_failure: Option<(Arc<dyn KiroEndpoint>, reqwest::StatusCode, String)> = None;
 
-            // 成功响应
-            if status.is_success() {
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::SUCCESS,
-                    None,
-                    attempt_start,
-                );
-                self.token_manager.report_success(ctx.id);
-                return Ok(KiroCallResult {
-                    response,
-                    credential_id: ctx.id,
-                    account_guard: ctx,
-                });
+            for (endpoint_index, endpoint) in endpoints.into_iter().enumerate() {
+                let endpoint_name = endpoint.name();
+                let endpoint_attempt_start = if endpoint_index == 0 { attempt_start } else { Instant::now() };
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config,
+                };
+                let url = endpoint.api_url(&rctx);
+                let body = endpoint.transform_api_body(request_body, &rctx);
+                tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
+                }
+                let base = http_client.post(&url).body(body).header("content-type", endpoint.content_type());
+                let request = endpoint.decorate_api(base, &rctx);
+                let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    for (k, v) in request.headers() {
+                        tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                    }
+                }
+                let response = match http_client.execute(request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!("API 请求发送失败（端点 {}, 尝试 {}/{}）: {}", endpoint_name, attempt + 1, max_retries, e);
+                        Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, None, outcome::NETWORK_ERROR, Some(&e.to_string()), endpoint_attempt_start);
+                        if Self::is_fallbackable_network_error() && endpoint_index + 1 < endpoint_count {
+                            tracing::warn!("Endpoint {} network error; trying next fallback on #{}", endpoint_name, ctx.id);
+                            continue;
+                        }
+                        last_error = Some(e.into());
+                        if attempt + 1 < max_retries { sleep(Self::retry_delay(attempt)).await; }
+                        break;
+                    }
+                };
+                let status = response.status();
+                if status.is_success() {
+                    Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::SUCCESS, None, endpoint_attempt_start);
+                    self.token_manager.report_success(ctx.id);
+                    return Ok(KiroCallResult { response, credential_id: ctx.id, account_guard: ctx });
+                }
+                let body = response.text().await.unwrap_or_default();
+                if Self::is_fallbackable_status(status) && endpoint_index + 1 < endpoint_count {
+                    tracing::warn!("Endpoint {} returned {}; trying next fallback on #{}", endpoint_name, status, ctx.id);
+                    Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::TRANSIENT, Some(&body), endpoint_attempt_start);
+                    continue;
+                }
+                selected_failure = Some((endpoint, status, body));
+                break;
             }
 
-            // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let Some((endpoint, status, body)) = selected_failure else { continue; };
+            let endpoint_name = endpoint.name();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
