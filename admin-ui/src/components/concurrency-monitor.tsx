@@ -139,6 +139,12 @@ export function CredentialScheduleMetrics({ c }: { c: CredentialStatusItem }) {
   const barColor =
     errRate >= 20 ? "bg-red-500" : pct >= 100 ? "bg-amber-500" : "bg-emerald-500";
 
+  // 成功率：成功 / (成功 + 累计失败)。无任何调用记录时显示占位。
+  const success = c.successCount ?? 0;
+  const totalFail = c.totalFailureCount ?? 0;
+  const attempts = success + totalFail;
+  const successRate = attempts > 0 ? (success / attempts) * 100 : null;
+
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2 text-[13px]">
@@ -167,9 +173,39 @@ export function CredentialScheduleMetrics({ c }: { c: CredentialStatusItem }) {
         </span>
       </div>
       <div className="flex items-center justify-between gap-2 text-[13px]">
+        <span className="shrink-0 text-muted-foreground">成功率</span>
+        <span
+          className={`tabular-nums font-medium ${
+            successRate === null
+              ? "text-muted-foreground/60"
+              : successRate >= 95
+                ? "text-emerald-600 dark:text-emerald-400"
+                : successRate >= 80
+                  ? "text-amber-600 dark:text-amber-400"
+                  : "text-destructive"
+          }`}
+          title={
+            successRate === null
+              ? "暂无调用记录"
+              : `成功 ${success} / 尝试 ${attempts}`
+          }
+        >
+          {successRate === null ? "—" : `${successRate.toFixed(1)}%`}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-2 text-[13px]">
         <span className="shrink-0 text-muted-foreground">平均耗时</span>
         <span className="tabular-nums font-medium text-muted-foreground">
           {formatEwmaMs(c.ewmaDurationMs ?? 0)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-2 text-[13px]">
+        <span className="shrink-0 text-muted-foreground">累计调度</span>
+        <span
+          className="tabular-nums font-medium text-muted-foreground"
+          title="进程内累计被调度选中的次数"
+        >
+          {(c.totalScheduled ?? 0).toLocaleString()}
         </span>
       </div>
     </div>

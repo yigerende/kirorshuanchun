@@ -363,6 +363,15 @@ async fn refresh_external_idp_token(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
 
+    // 二次白名单校验（导入派生时已校验一次）：防止 credentials 文件被篡改后把
+    // refreshToken 泄露到非 Microsoft 主机。对齐 Kiro-Go 刷新期 ValidateExternalIdpEndpoint。
+    if !crate::kiro::model::credentials::is_allowed_external_idp_endpoint(token_endpoint) {
+        anyhow::bail!(
+            "External IdP tokenEndpoint 非白名单主机（仅允许 Microsoft/Entra 登录域），拒绝刷新: {}",
+            token_endpoint
+        );
+    }
+
     let client = build_client(proxy, 60, config.tls_backend)?;
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),

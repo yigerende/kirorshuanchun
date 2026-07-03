@@ -464,13 +464,16 @@ impl KiroCredentials {
     }
 
     /// external_idp 数据面区域：以已解析的 `profile_arn` 为准（profileArn 的区域段
-    /// 才是数据面区域，可能是 `eu-central-1` 等），无法解析时回落 `us-east-1`。
+    /// 才是数据面区域，可能是 `eu-central-1` 等）；profileArn 尚未解析时回落到凭据
+    /// 自身 `region`，仍无则最终回落 `us-east-1`（对齐 Kiro-Go `kiroRegionForProfile`：
+    /// profileArn 区域 > account.Region > 默认）。
     ///
     /// 仅用于 external_idp 流式端点的主机/区域选择；其余凭据类型沿用 config 区域。
     pub fn data_plane_region(&self) -> &str {
         self.profile_arn
             .as_deref()
             .and_then(region_from_profile_arn)
+            .or(self.region.as_deref())
             .unwrap_or("us-east-1")
     }
 }
@@ -539,6 +542,23 @@ fn is_allowed_external_idp_host(host: &str) -> bool {
     ALLOWED_EXTERNAL_IDP_HOST_SUFFIXES
         .iter()
         .any(|suffix| host.ends_with(suffix))
+}
+
+/// 校验一个完整的 external_idp token 端点 URL 是否可安全访问（SSRF 防护）。
+///
+/// 强制 `https://`，且主机必须落在 [`ALLOWED_EXTERNAL_IDP_HOST_SUFFIXES`] 白名单内。
+/// 用于**刷新请求前的二次校验**（导入派生时已校验一次，此处防止 credentials 文件被
+/// 篡改后把 refreshToken 泄露到任意主机）——对齐 Kiro-Go 刷新期 `ValidateExternalIdpEndpoint`。
+pub fn is_allowed_external_idp_endpoint(url: &str) -> bool {
+    let rest = match url.trim().strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+    is_allowed_external_idp_host(host)
 }
 
 /// 从形如 `https://<host>/<tenant>/...` 的 URL 解析出 (host, tenant)。
@@ -860,6 +880,32 @@ mod tests {
     }
 
     #[test]
+    fn test_is_allowed_external_idp_endpoint() {
+        // 白名单主机 + https → 允许
+        assert!(is_allowed_external_idp_endpoint(
+            "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+        ));
+        assert!(is_allowed_external_idp_endpoint(
+            "https://login.microsoftonline.us/tenant/oauth2/v2.0/token"
+        ));
+        // 非 https → 拒绝
+        assert!(!is_allowed_external_idp_endpoint(
+            "http://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+        ));
+        // 非白名单主机（篡改成攻击者域名）→ 拒绝
+        assert!(!is_allowed_external_idp_endpoint(
+            "https://evil.example.com/tenant/oauth2/v2.0/token"
+        ));
+        // 白名单后缀被伪造成子串（非真正后缀）→ 拒绝
+        assert!(!is_allowed_external_idp_endpoint(
+            "https://login.microsoftonline.com.evil.com/t/token"
+        ));
+        // 空 / 畸形 → 拒绝
+        assert!(!is_allowed_external_idp_endpoint("https://"));
+        assert!(!is_allowed_external_idp_endpoint(""));
+    }
+
+    #[test]
     fn test_data_plane_region() {
         // 以已解析的 profileArn 区域为准
         let mut cred = KiroCredentials::default();
@@ -869,6 +915,17 @@ mod tests {
         // 无 profileArn → 回落 us-east-1
         let plain = KiroCredentials::default();
         assert_eq!(plain.data_plane_region(), "us-east-1");
+
+        // profileArn 尚未解析，但凭据自带 region → 用 region 兜底（对齐 Kiro-Go）
+        let mut region_only = KiroCredentials::default();
+        region_only.region = Some("eu-central-1".to_string());
+        assert_eq!(region_only.data_plane_region(), "eu-central-1");
+
+        // profileArn 区域优先于凭据 region（profileArn 才是真实数据面区域）
+        let mut both = KiroCredentials::default();
+        both.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        both.region = Some("us-east-1".to_string());
+        assert_eq!(both.data_plane_region(), "eu-central-1");
 
         // 占位符 profileArn（us-east-1）
         let mut placeholder = KiroCredentials::default();

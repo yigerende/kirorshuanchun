@@ -1277,6 +1277,17 @@ impl AdminService {
                 if scopes.as_deref().unwrap_or("").trim().is_empty() && !sc.is_empty() {
                     scopes = Some(sc);
                 }
+            } else {
+                // 派生失败：external_idp 账号缺 tokenEndpoint 且无法从 userId / accessToken
+                // 重建。明确告知可能原因，避免后续 refresh 只报泛化的「需要 tokenEndpoint」。
+                tracing::warn!(
+                    "external_idp 凭据（email={:?}）缺 tokenEndpoint 且端点派生失败：\
+                     userId 需为 KAM 账号级格式 https://login.microsoftonline.com/<tenant>/v2.0.<oid>，\
+                     或 accessToken 含可解析的 Microsoft iss；clientId={:?} 是否缺失。\
+                     该账号刷新将失败。",
+                    req.email,
+                    req.client_id
+                );
             }
         }
 

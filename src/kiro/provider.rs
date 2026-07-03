@@ -169,8 +169,6 @@ pub struct KiroCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -261,7 +259,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             streaming_client_cache: Mutex::new(streaming_client_cache),
             tls_backend,
@@ -274,7 +271,9 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        // 全局代理动态读自 token_manager（单一数据源），Admin 改代理后立即生效、无需重启。
+        let global_proxy = self.token_manager.proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
@@ -287,7 +286,9 @@ impl KiroProvider {
     /// 获取流式专用 Client（禁用空闲连接复用，见 [`build_streaming_client`]）。
     /// 与 [`Self::client_for`] 同构，但走独立的 `streaming_client_cache`。
     fn streaming_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        // 同 client_for：全局代理动态读自 token_manager，避免 provider 持有会过期的拷贝。
+        let global_proxy = self.token_manager.proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
         let mut cache = self.streaming_client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
