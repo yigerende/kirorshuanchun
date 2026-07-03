@@ -151,13 +151,21 @@ impl MeterGovernance {
         self.ttl_secs.store(ttl, Ordering::Relaxed);
     }
 
-    /// 记录本会话本次请求（时间 + 消息条数），返回**上轮缓存还热时的上次消息条数**。
+    /// 记录本会话本次请求（时间 + 消息条数**高水位**），返回**上轮缓存还热时的消息条数高水位**。
     ///
     /// 返回 `Some(prev_n)` = warm：该会话此前出现过 **且** 距上次请求 `<= TTL`（缓存未凉），
-    /// `prev_n` 是上次请求的 messages 条数，供调用方界定「本轮新增 = 当前条数 − prev_n」的
+    /// `prev_n` 是**已见过的消息条数高水位**，供调用方界定「本轮新增 = 当前条数 − prev_n」的
     /// creation 区间。返回 `None` = cold（首次出现 / 间隔超 TTL）→ 调用方把整段前缀按 creation
     /// 重写计费。`now` / `msg_count` 为本次请求的 unix 秒与 messages 条数（参数化便于测试）。
-    /// 调用即把 last_seen 刷新为 `(now, msg_count)`。
+    ///
+    /// **存高水位（`prev_n.max(msg_count)`）而非裸 msg_count**：`creation = msg_est[prev_n .. n-1]`
+    /// 的下界依赖 prev_n，但同一 session seed 上可能出现**更小 msg_count** 的请求——OpenAI 端点回退
+    /// key 级 seed 时多对话共享一条记录、Claude Code 的 title/探针/子任务复用同 session 但消息少、
+    /// 历史被重截断、并发乱序。裸存会把 prev_n 打小，使下一条真实长请求算出**横跨整段历史**的巨大
+    /// delta → `creation` 爆炸（吃掉本该进 read 便宜桶的历史）。取高水位后，短请求不再拉低下界，
+    /// 后续长请求的 creation 恢复到「真实新增」量级。副作用只在合法 compaction/截断使条数**永久**
+    /// 下降时出现：那一轮 creation 计 0（欠计新摘要）——**偏向便宜桶，经济上安全**，永不再虚高。
+    /// cold（缓存已凉）则重置基线为本次条数，不保留旧高水位（前缀确实要整段重建）。
     pub fn observe_session(&self, session: &str, now: i64, msg_count: usize) -> Option<usize> {
         let ttl = self.ttl_secs.load(Ordering::Relaxed) as i64;
         let mut map = self.last_seen.lock();
@@ -170,7 +178,12 @@ impl MeterGovernance {
             Some(&(last, prev_n)) if now.saturating_sub(last) <= ttl => Some(prev_n),
             _ => None,
         };
-        map.insert(session.to_string(), (now, msg_count));
+        // warm：存高水位（短请求不拉低下界）；cold：重置基线为本次条数。
+        let stored_n = match warm {
+            Some(prev_n) => prev_n.max(msg_count),
+            None => msg_count,
+        };
+        map.insert(session.to_string(), (now, stored_n));
         warm
     }
 }
@@ -380,6 +393,13 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 ///   1. metadata.user_id 里的 session 段（Claude Code 格式含 `_session_<uuid>`）；
 ///   2. 退回客户端 Key id。
 ///
+/// 注：无 session 的客户端（OpenAI 端点 `metadata:None`、裸客户端）退回 `key:{key_id}`，
+/// 同一 key 下多对话会共享一条 `MeterGovernance::observe_session` 记录。这**不会**再导致
+/// creation 爆炸——[`MeterGovernance::observe_session`] 用**消息条数高水位**，任何短请求
+/// 都不会把 delta 下界 `prev_n` 打小，共享 seed 下最长对话的高水位反而让其余对话 creation
+/// 偏低（命中率偏高，经济上安全）。曾尝试用对话指纹拆分 seed 做 per-conversation 隔离，
+/// 但实测把 fallback 流量拆成大量首见即 cold 的 seed → 命中率反降、creation 爆炸，已回退。
+///
 /// `pub(crate)`：响应缓存复用同一套会话隔离口径构造缓存键，保证两者隔离边界一致。
 pub(crate) fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
     if let Some(session) = req
@@ -510,6 +530,29 @@ mod tests {
         assert_eq!(creation, 100);
         assert_eq!(read, 0);
         assert_eq!(input, 900);
+    }
+
+    #[test]
+    fn split_pure_replay_hit_rate_equals_r() {
+        // 纯重放（creation_est≈0：无新增沉淀）时命中率精确 = R。锁住此语义:
+        //   R=1.0 → read≈total、input≈0 → 命中率 100%(贴近真实 Anthropic 稳态);
+        //   R=0.8 → read=total×0.8、input=total×0.2 → 命中率精确 80%(实证里所有高命中样本卡 80.0% 的成因)。
+        // 这是「配置能到多少」与「改码能到多少」归因的数学基准，不能悄悄漂移。
+        let replay = |r: f64| CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: 1000, // >0 触发分摊；input/creation 占比为 0 → read_base=total
+            read_ratio: r,
+        };
+        let hit = |(_i, _c, rd): (i32, i32, i32), tot: i32| rd as f64 / tot as f64;
+
+        let (i1, c1, r1) = replay(1.0).split_against_total(1000);
+        assert_eq!((i1, c1, r1), (0, 0, 1000), "R=1.0 纯重放 → 全 read");
+        assert!((hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9, "R=1.0 → 命中率 100%");
+
+        let (i8, c8, r8) = replay(0.8).split_against_total(1000);
+        assert_eq!((i8, c8, r8), (200, 0, 800), "R=0.8 → read=800、被砍 200 推回 input");
+        assert!((hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9, "R=0.8 → 命中率精确 80%");
     }
 
     #[test]
@@ -801,6 +844,71 @@ mod tests {
         assert_eq!(g.observe_session("sess:a", 1700, 11), Some(9), "刷新后 TTL 内应 warm");
         // 不同会话互不影响 → cold
         assert_eq!(g.observe_session("sess:b", 1700, 3), None, "另一会话首次应 cold");
+    }
+
+    #[test]
+    fn governance_hwm_short_request_does_not_lower_prev_n() {
+        // 核心修复：同一 seed 上出现更小 msg_count 的短请求（OpenAI key 级 seed 下的另一对话、
+        // title/探针/子任务、被重截断的历史），不得把 prev_n 下界打小 → 否则下一条长请求会算出
+        // 横跨整段历史的巨大 creation delta。存高水位后短请求不拉低下界。
+        let g = MeterGovernance::new(1.0, 300);
+        // 长对话到 200 条 → 首次 cold，记高水位 200。
+        assert_eq!(g.observe_session("key:42", 1000, 200), None);
+        // 同 seed 冒出一条短请求（另一对话/探针，只 3 条）→ warm，返回高水位 200（不是 3）。
+        assert_eq!(
+            g.observe_session("key:42", 1010, 3),
+            Some(200),
+            "短请求应读到高水位 200,而非被自己打小"
+        );
+        // 长对话回来到 202 条 → warm，返回的 prev_n 仍是高水位 200（旧 bug 会返回 3）。
+        assert_eq!(
+            g.observe_session("key:42", 1020, 202),
+            Some(200),
+            "长请求应读到高水位 200 → creation 只覆盖新增 2 条,不横跨历史"
+        );
+        // 高水位随真实增长上移。
+        assert_eq!(g.observe_session("key:42", 1030, 205), Some(202));
+    }
+
+    #[test]
+    fn governance_hwm_bounds_creation_delta() {
+        // 端到端证明高水位把 creation 从「横跨整段历史」压回「本轮新增」量级。
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        // 构造 6 条历史 + 末条：模拟长对话某轮 n=7。
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..6 {
+            msgs.push(msg(if i % 2 == 0 { "user" } else { "assistant" }, &body));
+        }
+        msgs.push(msg("user", "new q"));
+        let req = req_with(msgs, None);
+        let n = req.messages.len(); // 7
+
+        // 旧 bug：prev_n 被短请求打成 1 → creation 横跨 msg[1..6]（5 条）。
+        let exploded = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // 修复：高水位使 prev_n = n-2 = 5 → creation 只覆盖 msg[5..6]（1 条）。
+        let bounded = compute_structural_cache_usage(&req, 1.0, Some(n - 2));
+        assert!(
+            exploded.creation_est > bounded.creation_est * 3,
+            "打小的 prev_n 会让 creation 爆炸(exploded={} vs bounded={})",
+            exploded.creation_est,
+            bounded.creation_est
+        );
+    }
+
+    #[test]
+    fn governance_cold_resets_baseline_not_hwm() {
+        // cold（超 TTL，缓存确已凉）：重置基线为本次条数，不保留旧高水位——前缀整段要重建。
+        let g = MeterGovernance::new(1.0, 100);
+        assert_eq!(g.observe_session("key:9", 1000, 50), None); // 首次 cold，记 50
+        assert_eq!(g.observe_session("key:9", 1050, 52), Some(50), "TTL 内 warm");
+        // 超 TTL → cold，基线重置为本次的 4（不因高水位 52 而保留）。
+        assert_eq!(g.observe_session("key:9", 1300, 4), None, "超 TTL 应 cold");
+        // 紧接着来 → warm，读到刚重置的 4（证明 cold 没保留旧高水位 52）。
+        assert_eq!(
+            g.observe_session("key:9", 1310, 6),
+            Some(4),
+            "cold 后基线应是重置值 4,不是旧高水位 52"
+        );
     }
 
     #[test]
