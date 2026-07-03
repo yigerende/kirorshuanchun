@@ -8,16 +8,18 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME;
 use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
 use crate::kiro::endpoint::codewhisperer::CODEWHISPERER_ENDPOINT_NAME;
 use crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME;
+use crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME;
+use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
@@ -37,11 +39,7 @@ pub(crate) fn truncate_for_log(body: &str) -> std::borrow::Cow<'_, str> {
     while end > 0 && !body.is_char_boundary(end) {
         end -= 1;
     }
-    std::borrow::Cow::Owned(format!(
-        "{}…[截断,完整 {} bytes]",
-        &body[..end],
-        body.len()
-    ))
+    std::borrow::Cow::Owned(format!("{}…[截断,完整 {} bytes]", &body[..end], body.len()))
 }
 
 /// 每个凭据的最大重试次数
@@ -61,6 +59,53 @@ const LARGE_REQUEST_BYTES: usize = 512 * 1024;
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
+
+const AUTO_ENDPOINT_NAME: &str = "auto";
+const KIRO_ENDPOINT_ALIAS: &str = "kiro";
+
+/// 端点路由运行时配置（首选端点 + fallback 开关）。
+///
+/// 与 [`MeterGovernance`](crate::anthropic::cache_metering::MeterGovernance) 等治理组件同构：
+/// 以 `Arc<EndpointRouting>` 在 `KiroProvider` 与 `AdminService` 间共享，Admin 面板改动后
+/// **运行时立即对后续请求生效**、无需重启。`default_endpoint` 与端点注册表仍是构造期不可变量
+/// （注册表关系到 client 预热与断言），此处只承载两个可热更的旋钮。
+pub struct EndpointRouting {
+    /// 首选端点名（`auto` / `kiro` / `ide` / `cli` / `codewhisperer` / `amazonq` / `runtime`）。
+    /// `None` 表示未设置——回退到凭据级 `endpoint` 或 `default_endpoint`。
+    preferred: Mutex<Option<String>>,
+    /// 是否在同一凭据上尝试其余 Kiro-Go 兼容端点（对齐 Kiro-Go auto 路由，并含 runtime）。
+    fallback: AtomicBool,
+}
+
+impl EndpointRouting {
+    /// 用初始首选端点 + fallback 开关构造。
+    pub fn new(preferred: Option<String>, fallback: bool) -> Self {
+        Self {
+            preferred: Mutex::new(preferred),
+            fallback: AtomicBool::new(fallback),
+        }
+    }
+
+    /// 当前首选端点名（`None` 表示未设置）。
+    pub fn preferred(&self) -> Option<String> {
+        self.preferred.lock().clone()
+    }
+
+    /// 设置首选端点名（`None` 清除），运行时立即对后续请求生效。
+    pub fn set_preferred(&self, preferred: Option<String>) {
+        *self.preferred.lock() = preferred;
+    }
+
+    /// 当前 fallback 开关。
+    pub fn fallback(&self) -> bool {
+        self.fallback.load(Ordering::Relaxed)
+    }
+
+    /// 设置 fallback 开关，运行时立即对后续请求生效。
+    pub fn set_fallback(&self, enabled: bool) {
+        self.fallback.store(enabled, Ordering::Relaxed);
+    }
+}
 
 /// 带容量上限的 HTTP Client 缓存。
 ///
@@ -140,10 +185,9 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
-    /// Preferred endpoint when route-level fallback is enabled.
-    preferred_endpoint: Option<String>,
-    /// Whether to try Kiro-Go-compatible fallback endpoints on the same credential.
-    endpoint_fallback: bool,
+    /// 端点路由运行时配置（首选端点 + fallback 开关）。与 `AdminService` 共享同一
+    /// `Arc<EndpointRouting>`，Admin 面板改动后对后续请求立即生效、无需重启。
+    routing: Arc<EndpointRouting>,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -153,6 +197,31 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    fn endpoint_alias(name: &str) -> &str {
+        if name == KIRO_ENDPOINT_ALIAS {
+            IDE_ENDPOINT_NAME
+        } else {
+            name
+        }
+    }
+
+    fn is_auto_endpoint(name: &str) -> bool {
+        name == AUTO_ENDPOINT_NAME
+    }
+
+    fn is_known_config_endpoint(
+        endpoints: &HashMap<String, Arc<dyn KiroEndpoint>>,
+        name: &str,
+    ) -> bool {
+        Self::is_auto_endpoint(name) || endpoints.contains_key(Self::endpoint_alias(name))
+    }
+
+    fn next_trace_step(trace_step: &mut usize) -> usize {
+        let step = *trace_step;
+        *trace_step = (*trace_step).saturating_add(1);
+        step
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -165,17 +234,16 @@ impl KiroProvider {
         proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
-        preferred_endpoint: Option<String>,
-        endpoint_fallback: bool,
+        routing: Arc<EndpointRouting>,
     ) -> Self {
         assert!(
-            endpoints.contains_key(&default_endpoint),
+            Self::is_known_config_endpoint(&endpoints, &default_endpoint),
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
-        if let Some(preferred) = preferred_endpoint.as_deref() {
+        if let Some(preferred) = routing.preferred() {
             assert!(
-                endpoints.contains_key(preferred),
+                Self::is_known_config_endpoint(&endpoints, &preferred),
                 "preferred endpoint {} 未在 endpoints 注册表中",
                 preferred
             );
@@ -199,8 +267,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
-            preferred_endpoint,
-            endpoint_fallback,
+            routing,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -232,10 +299,15 @@ impl KiroProvider {
 
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = credentials
+        let configured = credentials
             .endpoint
             .as_deref()
             .unwrap_or(&self.default_endpoint);
+        let name = if Self::is_auto_endpoint(configured) {
+            IDE_ENDPOINT_NAME
+        } else {
+            Self::endpoint_alias(configured)
+        };
         self.endpoints
             .get(name)
             .cloned()
@@ -249,37 +321,63 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
-        let primary = credentials
+        // 首选端点为运行时热更值（Admin 面板可改），取其快照后再借用。
+        let preferred = self.routing.preferred();
+        let configured = credentials
             .endpoint
             .as_deref()
-            .or(self.preferred_endpoint.as_deref())
+            .or(preferred.as_deref())
             .unwrap_or(&self.default_endpoint);
-        if !self.endpoint_fallback || primary == CLI_ENDPOINT_NAME {
-            return self.endpoints.get(primary).cloned()
-                .map(|endpoint| vec![endpoint])
-                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", primary));
-        }
-        const FALLBACK_ORDER: [&str; 3] = [
+        const FALLBACK_ORDER: [&str; 4] = [
             IDE_ENDPOINT_NAME,
             CODEWHISPERER_ENDPOINT_NAME,
             AMAZONQ_ENDPOINT_NAME,
+            RUNTIME_ENDPOINT_NAME,
         ];
-        if !FALLBACK_ORDER.contains(&primary) {
-            return self.endpoints.get(primary).cloned()
+        if Self::is_auto_endpoint(configured) {
+            return FALLBACK_ORDER
+                .into_iter()
+                .map(|name| {
+                    self.endpoints
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+                })
+                .collect();
+        }
+        let primary = Self::endpoint_alias(configured);
+        if !self.routing.fallback() || primary == CLI_ENDPOINT_NAME {
+            return self
+                .endpoints
+                .get(primary)
+                .cloned()
                 .map(|endpoint| vec![endpoint])
                 .ok_or_else(|| anyhow::anyhow!("未知端点: {}", primary));
         }
-        let mut names = Vec::with_capacity(3);
+        if !FALLBACK_ORDER.contains(&primary) {
+            return self
+                .endpoints
+                .get(primary)
+                .cloned()
+                .map(|endpoint| vec![endpoint])
+                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", primary));
+        }
+        let mut names = Vec::with_capacity(FALLBACK_ORDER.len());
         names.push(primary);
         for name in FALLBACK_ORDER {
             if name != primary {
                 names.push(name);
             }
         }
-        names.into_iter().map(|name| {
-            self.endpoints.get(name).cloned()
-                .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
-        }).collect()
+        names
+            .into_iter()
+            .map(|name| {
+                self.endpoints
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+            })
+            .collect()
     }
 
     fn is_fallbackable_status(status: reqwest::StatusCode) -> bool {
@@ -550,6 +648,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        let mut trace_step = 0usize;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -581,7 +680,7 @@ impl KiroProvider {
                 Err(e) => {
                     Self::emit_attempt(
                         sink,
-                        attempt,
+                        Self::next_trace_step(&mut trace_step),
                         0,
                         "",
                         None,
@@ -610,7 +709,16 @@ impl KiroProvider {
             let endpoints = match self.endpoint_order_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    Self::emit_attempt(sink, attempt, ctx.id, "", None, outcome::UNKNOWN, Some(&e.to_string()), attempt_start);
+                    Self::emit_attempt(
+                        sink,
+                        Self::next_trace_step(&mut trace_step),
+                        ctx.id,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
                     continue;
@@ -625,19 +733,39 @@ impl KiroProvider {
             } {
                 Ok(c) => c,
                 Err(e) => {
-                    Self::emit_attempt(sink, attempt, ctx.id, "", None, outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start);
+                    Self::emit_attempt(
+                        sink,
+                        Self::next_trace_step(&mut trace_step),
+                        ctx.id,
+                        "",
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
-                    if attempt + 1 < max_retries { sleep(Self::retry_delay(attempt)).await; }
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
             };
 
             let endpoint_count = endpoints.len();
-            let mut selected_failure: Option<(Arc<dyn KiroEndpoint>, reqwest::StatusCode, String)> = None;
+            let mut selected_failure: Option<(
+                Arc<dyn KiroEndpoint>,
+                reqwest::StatusCode,
+                String,
+                Instant,
+            )> = None;
 
             for (endpoint_index, endpoint) in endpoints.into_iter().enumerate() {
                 let endpoint_name = endpoint.name();
-                let endpoint_attempt_start = if endpoint_index == 0 { attempt_start } else { Instant::now() };
+                let endpoint_attempt_start = if endpoint_index == 0 {
+                    attempt_start
+                } else {
+                    Instant::now()
+                };
                 let rctx = RequestContext {
                     credentials: &ctx.credentials,
                     token: &ctx.token,
@@ -650,9 +778,14 @@ impl KiroProvider {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
                 }
-                let base = http_client.post(&url).body(body).header("content-type", endpoint.content_type());
+                let base = http_client
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", endpoint.content_type());
                 let request = endpoint.decorate_api(base, &rctx);
-                let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+                let request = request
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     for (k, v) in request.headers() {
                         tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
@@ -661,34 +794,86 @@ impl KiroProvider {
                 let response = match http_client.execute(request).await {
                     Ok(resp) => resp,
                     Err(e) => {
-                        tracing::warn!("API 请求发送失败（端点 {}, 尝试 {}/{}）: {}", endpoint_name, attempt + 1, max_retries, e);
-                        Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, None, outcome::NETWORK_ERROR, Some(&e.to_string()), endpoint_attempt_start);
-                        if Self::is_fallbackable_network_error() && endpoint_index + 1 < endpoint_count {
-                            tracing::warn!("Endpoint {} network error; trying next fallback on #{}", endpoint_name, ctx.id);
+                        tracing::warn!(
+                            "API 请求发送失败（端点 {}, 尝试 {}/{}）: {}",
+                            endpoint_name,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        Self::emit_attempt(
+                            sink,
+                            Self::next_trace_step(&mut trace_step),
+                            ctx.id,
+                            endpoint_name,
+                            None,
+                            outcome::NETWORK_ERROR,
+                            Some(&e.to_string()),
+                            endpoint_attempt_start,
+                        );
+                        if Self::is_fallbackable_network_error()
+                            && endpoint_index + 1 < endpoint_count
+                        {
+                            tracing::warn!(
+                                "Endpoint {} network error; trying next fallback on #{}",
+                                endpoint_name,
+                                ctx.id
+                            );
                             continue;
                         }
                         last_error = Some(e.into());
-                        if attempt + 1 < max_retries { sleep(Self::retry_delay(attempt)).await; }
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
                         break;
                     }
                 };
                 let status = response.status();
                 if status.is_success() {
-                    Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::SUCCESS, None, endpoint_attempt_start);
+                    Self::emit_attempt(
+                        sink,
+                        Self::next_trace_step(&mut trace_step),
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::SUCCESS,
+                        None,
+                        endpoint_attempt_start,
+                    );
                     self.token_manager.report_success(ctx.id);
-                    return Ok(KiroCallResult { response, credential_id: ctx.id, account_guard: ctx });
+                    return Ok(KiroCallResult {
+                        response,
+                        credential_id: ctx.id,
+                        account_guard: ctx,
+                    });
                 }
                 let body = response.text().await.unwrap_or_default();
                 if Self::is_fallbackable_status(status) && endpoint_index + 1 < endpoint_count {
-                    tracing::warn!("Endpoint {} returned {}; trying next fallback on #{}", endpoint_name, status, ctx.id);
-                    Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::TRANSIENT, Some(&body), endpoint_attempt_start);
+                    tracing::warn!(
+                        "Endpoint {} returned {}; trying next fallback on #{}",
+                        endpoint_name,
+                        status,
+                        ctx.id
+                    );
+                    Self::emit_attempt(
+                        sink,
+                        Self::next_trace_step(&mut trace_step),
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::TRANSIENT,
+                        Some(&body),
+                        endpoint_attempt_start,
+                    );
                     continue;
                 }
-                selected_failure = Some((endpoint, status, body));
+                selected_failure = Some((endpoint, status, body, endpoint_attempt_start));
                 break;
             }
 
-            let Some((endpoint, status, body)) = selected_failure else { continue; };
+            let Some((endpoint, status, body, endpoint_attempt_start)) = selected_failure else {
+                continue;
+            };
             let endpoint_name = endpoint.name();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
@@ -702,13 +887,13 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::QUOTA_EXHAUSTED,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -734,13 +919,13 @@ impl KiroProvider {
             if status.as_u16() == 400 {
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(400),
                     outcome::BAD_REQUEST,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -772,13 +957,13 @@ impl KiroProvider {
                         .report_account_throttled(ctx.id, cooldown);
                     Self::emit_attempt(
                         sink,
-                        attempt,
+                        Self::next_trace_step(&mut trace_step),
                         ctx.id,
                         endpoint_name,
                         Some(403),
                         outcome::ACCOUNT_THROTTLED,
                         Some(&body),
-                        attempt_start,
+                        endpoint_attempt_start,
                     );
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（账号级临时封锁，凭据 #{} 已冷却 {} 分钟）: {} {}",
@@ -813,13 +998,13 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::AUTH_FAILED,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -882,13 +1067,13 @@ impl KiroProvider {
                     .report_account_throttled(ctx.id, cooldown);
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(429),
                     outcome::ACCOUNT_THROTTLED,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
@@ -927,13 +1112,13 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::BAD_REQUEST,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -945,13 +1130,13 @@ impl KiroProvider {
                 tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::TRANSIENT,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -977,13 +1162,13 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(429),
                     outcome::RATE_LIMITED,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败（账号 #{} 请求速率超限）: {} {}",
@@ -1012,13 +1197,13 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::TRANSIENT,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -1053,13 +1238,13 @@ impl KiroProvider {
             if status.is_client_error() {
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    Self::next_trace_step(&mut trace_step),
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
                     outcome::BAD_REQUEST,
                     Some(&body),
-                    attempt_start,
+                    endpoint_attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1074,13 +1259,13 @@ impl KiroProvider {
             );
             Self::emit_attempt(
                 sink,
-                attempt,
+                Self::next_trace_step(&mut trace_step),
                 ctx.id,
                 endpoint_name,
                 Some(status.as_u16()),
                 outcome::UNKNOWN,
                 Some(&body),
-                attempt_start,
+                endpoint_attempt_start,
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
@@ -1167,5 +1352,50 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_endpoint_routing_initial_values() {
+        let r = EndpointRouting::new(Some("codewhisperer".to_string()), false);
+        assert_eq!(r.preferred().as_deref(), Some("codewhisperer"));
+        assert!(!r.fallback());
+
+        let empty = EndpointRouting::new(None, true);
+        assert_eq!(empty.preferred(), None);
+        assert!(empty.fallback());
+    }
+
+    #[test]
+    fn test_endpoint_routing_hot_update() {
+        let r = EndpointRouting::new(None, true);
+        // 首选端点热更新：None → Some → None（清除）
+        r.set_preferred(Some("amazonq".to_string()));
+        assert_eq!(r.preferred().as_deref(), Some("amazonq"));
+        r.set_preferred(None);
+        assert_eq!(r.preferred(), None);
+        // fallback 开关热更新
+        r.set_fallback(false);
+        assert!(!r.fallback());
+        r.set_fallback(true);
+        assert!(r.fallback());
+    }
+
+    #[test]
+    fn test_endpoint_routing_shared_arc_reflects_updates() {
+        // 模拟 provider 与 admin 共享同一 Arc：一侧改，另一侧立即可见。
+        let routing = Arc::new(EndpointRouting::new(Some("ide".to_string()), true));
+        let admin_view = routing.clone();
+
+        admin_view.set_preferred(Some("runtime".to_string()));
+        admin_view.set_fallback(false);
+
+        // provider 侧读到的即是 admin 侧写入的最新值（无需重启/重建）。
+        assert_eq!(routing.preferred().as_deref(), Some("runtime"));
+        assert!(!routing.fallback());
     }
 }

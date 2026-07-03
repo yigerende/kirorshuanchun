@@ -449,8 +449,7 @@ mod tests {
             &[msg(json!([{"type": "text", "text": "hello world"}]))],
             &None,
         );
-        let from_string =
-            count_all_tokens_local(&None, &[msg(json!("hello world"))], &None);
+        let from_string = count_all_tokens_local(&None, &[msg(json!("hello world"))], &None);
         assert_eq!(from_block, from_string);
         assert!(from_block > 1);
     }
@@ -464,8 +463,11 @@ mod tests {
         ]))];
         let total = count_all_tokens_local(&None, &messages, &None);
         // 应同时包含三块；明显大于任一单块。
-        let only_text =
-            count_all_tokens_local(&None, &[msg(json!([{"type": "text", "text": "前导说明"}]))], &None);
+        let only_text = count_all_tokens_local(
+            &None,
+            &[msg(json!([{"type": "text", "text": "前导说明"}]))],
+            &None,
+        );
         assert!(total > only_text, "混合块应累加全部贡献");
     }
 }

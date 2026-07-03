@@ -223,7 +223,11 @@ impl ResponseCache {
 
     /// 解析「该 Key 生效的响应缓存配置」：per-key 覆盖优先，否则回退本缓存的全局默认（运行时值）。
     /// 返回 `(enabled, ttl_secs)`；`enabled=false` 时调用方直接跳过查询/写入。
-    pub fn effective_config(&self, key_enabled: Option<bool>, key_ttl_secs: Option<u32>) -> (bool, u64) {
+    pub fn effective_config(
+        &self,
+        key_enabled: Option<bool>,
+        key_ttl_secs: Option<u32>,
+    ) -> (bool, u64) {
         effective_cache_config(
             key_enabled,
             key_ttl_secs,

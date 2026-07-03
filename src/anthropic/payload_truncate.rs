@@ -22,7 +22,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use super::converter::{convert_request, ConversionError, ConversionResult};
+use super::converter::{ConversionError, ConversionResult, convert_request};
 use super::types::{Message, MessagesRequest};
 use crate::kiro::model::requests::kiro::KiroRequest;
 
@@ -37,8 +37,7 @@ const MIN_RECENT_TURNS: usize = 6;
 const MAX_TRIM_ITERS: usize = 12;
 
 /// Placeholder inserted (as a user turn) where older messages were dropped.
-const TRUNCATION_PLACEHOLDER: &str =
-    "[Earlier conversation history was truncated to fit the model's input limit. \
+const TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. \
 Older messages and tool activity have been omitted.]";
 
 /// Config for whole-payload truncation. `max_bytes == 0` disables.
@@ -172,10 +171,16 @@ mod tests {
     }
 
     fn user_text(s: &str) -> Message {
-        Message { role: "user".to_string(), content: json!(s) }
+        Message {
+            role: "user".to_string(),
+            content: json!(s),
+        }
     }
     fn assistant_text(s: &str) -> Message {
-        Message { role: "assistant".to_string(), content: json!(s) }
+        Message {
+            role: "assistant".to_string(),
+            content: json!(s),
+        }
     }
     /// assistant turn that calls a tool (tool_use), paired with the following user tool_result.
     fn assistant_tool_use(id: &str, payload: &str) -> Message {
@@ -244,12 +249,20 @@ mod tests {
                 }
             }
         }
-        assert!(violations.is_empty(), "pairing violations: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "pairing violations: {:?}",
+            violations
+        );
     }
 
     #[test]
     fn disabled_is_single_convert() {
-        let mut p = req(vec![user_text("hi"), assistant_text("hello"), user_text("now")]);
+        let mut p = req(vec![
+            user_text("hi"),
+            assistant_text("hello"),
+            user_text("now"),
+        ]);
         let r = convert_within_limit(&mut p, &cfg(0)).unwrap();
         assert_pairing_valid(&r);
         // disabled → messages untouched (3 in, last is current → 2 history turns kept).
@@ -258,7 +271,11 @@ mod tests {
 
     #[test]
     fn under_budget_untouched() {
-        let mut p = req(vec![user_text("short"), assistant_text("ok"), user_text("q")]);
+        let mut p = req(vec![
+            user_text("short"),
+            assistant_text("ok"),
+            user_text("q"),
+        ]);
         let n = p.messages.len();
         let r = convert_within_limit(&mut p, &cfg(640_000)).unwrap();
         assert_pairing_valid(&r);
@@ -313,9 +330,12 @@ mod tests {
     fn huge_single_turn_still_valid() {
         // Current message alone is enormous; cannot trim below MIN_RECENT_TURNS — must still
         // produce a pairing-valid payload (no panic, no orphan), even if over cap.
-        let mut p = req(vec![user_text("x"), assistant_text("y"), user_text(&"z".repeat(800_000))]);
+        let mut p = req(vec![
+            user_text("x"),
+            assistant_text("y"),
+            user_text(&"z".repeat(800_000)),
+        ]);
         let r = convert_within_limit(&mut p, &cfg(300_000)).unwrap();
         assert_pairing_valid(&r);
     }
 }
-

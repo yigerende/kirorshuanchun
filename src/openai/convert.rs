@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use crate::anthropic::types::{MessagesRequest, Message, SystemMessage, Thinking, Tool};
+use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
 
 use super::types::ChatCompletionRequest;
 
@@ -52,8 +52,7 @@ fn thinking_from_model(model: &str) -> Option<Thinking> {
     if !lower.contains("thinking") {
         return None;
     }
-    let is_opus_4_6 =
-        lower.contains("opus") && (lower.contains("4-6") || lower.contains("4.6"));
+    let is_opus_4_6 = lower.contains("opus") && (lower.contains("4-6") || lower.contains("4.6"));
     let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
     Some(Thinking {
         thinking_type: thinking_type.to_string(),
@@ -107,7 +106,10 @@ fn convert_image_part(part: &Value) -> Option<Value> {
     let url = part
         .get("image_url")
         .and_then(|v| v.get("url").and_then(|u| u.as_str()).or_else(|| v.as_str()))
-        .or_else(|| part.get("image").and_then(|v| v.get("url").and_then(|u| u.as_str())))
+        .or_else(|| {
+            part.get("image")
+                .and_then(|v| v.get("url").and_then(|u| u.as_str()))
+        })
         .or_else(|| part.get("url").and_then(|v| v.as_str()))?;
 
     let rest = url.strip_prefix("data:")?;
@@ -527,6 +529,3 @@ mod tests {
         assert_eq!(m.max_tokens, 1234);
     }
 }
-
-
-

@@ -205,7 +205,7 @@ pub fn now_unix_secs() -> i64 {
 // ============================================================================
 
 use super::stream::estimate_tokens;
-use super::types::{MessagesRequest, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, SystemMessage, Tool};
 
 /// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构、R、上轮消息条数，
 /// 不依赖时间或负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
@@ -213,13 +213,40 @@ use super::types::{MessagesRequest, SystemMessage, Tool};
 /// 桶划分（见模块文档）：input = 最后一条 message；read = 其余前缀。`read_ratio` 是该请求
 /// 生效的 R（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
 ///
-/// `prev_msg_count` 是本会话上轮缓存还热时的上次消息条数（见 [`MeterGovernance::observe_session`]）:
-/// - **`Some(prev_n)`**（缓存还热）→ creation = `messages[prev_n .. n-1]`，即上次见到后**新增、
-///   且已沉为稳定前缀**的那几条（标准对话 = 倒数第二条一条；agent 工具循环可能多条），其余前缀
-///   走 read 便宜桶。`prev_n` 钳到 `[0, n-1]`；若 `prev_n >= n-1`（无新增沉淀）则 creation=0。
+/// `prev_msg_count` 只用作 **warm/cold 布尔标志**（`Some`=缓存还热 / `None`=首次或超 TTL 已凉），
+/// **其具体数值不再参与计算**——跨请求 msg_count 在共享/交错 seed 下不可靠（见 warm 分支注释）。
+/// - **`Some(_)`**（缓存还热）→ creation = 最近一个 user 回合之后、到 input 之前的那几条（纯结构
+///   判据，见 [`last_turn_creation_start`]），其余前缀走 read 便宜桶。标准对话 = 一条 assistant
+///   回复；agent 工具循环 = 本轮全部 tool_use/tool_result。
 /// - **`None`**（首次出现 / 超 TTL 缓存已凉）→ 整段可缓存前缀（system+tools+除最后一条外的全部
 ///   历史）按 **creation** 重写计费、read 基数=0，如同首轮重建缓存。这让"凉了的会话"不再白
 ///   拿 0.1× 折扣。
+/// warm 轮「本轮新写入缓存」区间的起点(纯结构,无跨请求状态)。
+///
+/// 语义:`input`(最后一条)之前,回退到**倒数第二个 user 消息**;它之后、到 input 之前的
+/// 那几条,就是上一个人类回合触发、本轮才沉为稳定前缀的内容(标准对话=一条 assistant 回复;
+/// agent 工具循环=一串 assistant tool_use + user tool_result)。返回该区间起点索引 `start`,
+/// 使 `creation = messages[start .. n-1]`,其余前缀走 read。
+///
+/// 找不到更早的 user 消息(整段只有当前这一轮)→ 返回 0,creation 覆盖除 input 外的全部,
+/// 与"新对话首次沉淀"一致。索引落在 `[0, n-1]`。
+fn last_turn_creation_start(messages: &[Message]) -> usize {
+    let n = messages.len();
+    if n <= 1 {
+        return 0;
+    }
+    // 从 input(n-1)之前往回找最近的 user 消息;它之后即本轮新增。
+    // messages[n-1] 是 input 本身,从 n-2 开始回扫。
+    for i in (0..n - 1).rev() {
+        if messages[i].role == "user" {
+            // 该 user 之后的第一条 = 新增起点。
+            return i + 1;
+        }
+    }
+    // 没有更早的 user 消息 → 全部(除 input)算新增。
+    0
+}
+
 pub fn compute_structural_cache_usage(
     req: &MessagesRequest,
     read_ratio: f64,
@@ -263,9 +290,17 @@ pub fn compute_structural_cache_usage(
     //     循环一轮补进多对 → 覆盖全部新增中间消息。prev_n >= n-1（无新增沉淀，如纯重放）→ creation=0。
     let creation_est = match prev_msg_count {
         None => prompt_total_est.saturating_sub(input_est),
-        Some(prev_n) => {
-            let start = prev_n.min(n - 1);
-            msg_est[start..n - 1].iter().fold(0i32, |a, b| a.saturating_add(*b))
+        Some(_warm) => {
+            // 结构化界定「本轮新写入缓存」的部分,不再用 prev_n 的具体值。
+            // 跨请求 msg_count 在共享/交错 seed 上不可靠(OpenAI key 级回退、同 session 长短请求
+            // 交错、重试、compaction):裸存会把区间下界打小→creation 爆炸;高水位会把下界顶高
+            // →creation 塌成 0。两者都是同一脆弱假设的两个极端。改用纯结构判据:本轮新增 =
+            // 最近一个 user 回合之后、到 input 之前的内容(标准对话=上轮 assistant 回复;agent
+            // 工具循环=本轮全部 tool_use/tool_result)。只看当前请求结构,免疫 seed 共享与交错。
+            let start = last_turn_creation_start(&req.messages);
+            msg_est[start..n - 1]
+                .iter()
+                .fold(0i32, |a, b| a.saturating_add(*b))
         }
     };
 
@@ -326,8 +361,10 @@ fn block_tokens(v: &serde_json::Value) -> i32 {
         }
         Some("image") => {
             let (media_type, data) = image_source_parts(v);
-            sum = sum
-                .saturating_add(crate::image_resize::estimate_image_tokens(media_type, data) as i32);
+            sum =
+                sum.saturating_add(
+                    crate::image_resize::estimate_image_tokens(media_type, data) as i32
+                );
         }
         _ => {}
     }
@@ -346,9 +383,9 @@ fn tool_result_content_tokens(content: Option<&serde_json::Value>) -> i32 {
                     sum = sum.saturating_add(estimate_tokens(text).max(0));
                 } else if item.get("type").and_then(|x| x.as_str()) == Some("image") {
                     let (media_type, data) = image_source_parts(item);
-                    sum = sum.saturating_add(
-                        crate::image_resize::estimate_image_tokens(media_type, data) as i32,
-                    );
+                    sum = sum.saturating_add(crate::image_resize::estimate_image_tokens(
+                        media_type, data,
+                    ) as i32);
                 }
             }
             sum
@@ -424,8 +461,8 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{Message, MessagesRequest, Metadata, SystemMessage};
+    use super::*;
 
     fn msg(role: &str, text: &str) -> Message {
         Message {
@@ -548,11 +585,21 @@ mod tests {
 
         let (i1, c1, r1) = replay(1.0).split_against_total(1000);
         assert_eq!((i1, c1, r1), (0, 0, 1000), "R=1.0 纯重放 → 全 read");
-        assert!((hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9, "R=1.0 → 命中率 100%");
+        assert!(
+            (hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9,
+            "R=1.0 → 命中率 100%"
+        );
 
         let (i8, c8, r8) = replay(0.8).split_against_total(1000);
-        assert_eq!((i8, c8, r8), (200, 0, 800), "R=0.8 → read=800、被砍 200 推回 input");
-        assert!((hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9, "R=0.8 → 命中率精确 80%");
+        assert_eq!(
+            (i8, c8, r8),
+            (200, 0, 800),
+            "R=0.8 → read=800、被砍 200 推回 input"
+        );
+        assert!(
+            (hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9,
+            "R=0.8 → 命中率精确 80%"
+        );
     }
 
     #[test]
@@ -606,7 +653,10 @@ mod tests {
         assert_eq!(cold.prompt_total_est, warm.prompt_total_est);
         // cold 的 creation = 整段前缀 = total − input;warm 的 creation 只一条,远小于 cold。
         assert_eq!(cold.creation_est, cold.prompt_total_est - cold.input_est);
-        assert!(cold.creation_est > warm.creation_est * 2, "cold 把整段前缀都计 creation");
+        assert!(
+            cold.creation_est > warm.creation_est * 2,
+            "cold 把整段前缀都计 creation"
+        );
 
         let (ci, cc, cr) = cold.split_against_total(cold.prompt_total_est);
         assert_eq!(cr, 0, "cold 无 read(整段重写)");
@@ -671,7 +721,10 @@ mod tests {
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(read > 0, "非首轮应有 cache_read");
         assert!(creation > 0);
-        assert!(read > creation, "read（system+u1）应远大于 creation（仅 a1）");
+        assert!(
+            read > creation,
+            "read（system+u1）应远大于 creation（仅 a1）"
+        );
         assert_eq!(input + creation + read, u.prompt_total_est);
     }
 
@@ -680,7 +733,11 @@ mod tests {
         // 核心经济性质：对话越长，creation 仍≈一条 message，不随历史线性增长。
         let unit = "lorem ipsum dolor sit amet ".repeat(10);
         let short = req_with(
-            vec![msg("user", &unit), msg("assistant", &unit), msg("user", "q")],
+            vec![
+                msg("user", &unit),
+                msg("assistant", &unit),
+                msg("user", "q"),
+            ],
             None,
         );
         // 长对话：20 条历史 + 本轮
@@ -697,7 +754,10 @@ mod tests {
         // creation_est 都≈一条 assistant 消息，长对话不放大
         let a_est = message_tokens(&msg("assistant", &unit));
         assert_eq!(cu_short.creation_est, a_est);
-        assert_eq!(cu_long.creation_est, a_est, "长对话 creation 仍是一条 message");
+        assert_eq!(
+            cu_long.creation_est, a_est,
+            "长对话 creation 仍是一条 message"
+        );
         // 而 prompt_total（→read 基数）长对话远大于短对话
         assert!(cu_long.prompt_total_est > cu_short.prompt_total_est * 5);
 
@@ -713,12 +773,18 @@ mod tests {
         // R 越大，read 越多、input 越少；creation 不变。
         let body = "lorem ipsum dolor sit amet ".repeat(20);
         let req = req_with(
-            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            vec![
+                msg("user", &body),
+                msg("assistant", &body),
+                msg("user", "q"),
+            ],
             None,
         );
         let total = compute_structural_cache_usage(&req, 1.0, Some(1)).prompt_total_est;
-        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5, Some(1)).split_against_total(total);
-        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0, Some(1)).split_against_total(total);
+        let (i_lo, c_lo, r_lo) =
+            compute_structural_cache_usage(&req, 0.5, Some(1)).split_against_total(total);
+        let (i_hi, c_hi, r_hi) =
+            compute_structural_cache_usage(&req, 1.0, Some(1)).split_against_total(total);
         assert!(r_hi > r_lo, "R 越大 read 越多");
         assert!(i_hi < i_lo, "R 越大 input 越少（折扣更足）");
         assert_eq!(c_lo, c_hi, "creation 不受 R 影响");
@@ -745,7 +811,10 @@ mod tests {
         );
         let u = compute_structural_cache_usage(&req, 1.0, Some(1));
         // 含图历史(u1)在 read 前缀里 → prompt_total 应远大于本轮纯文本新输入。
-        assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
+        assert!(
+            u.prompt_total_est >= img_tokens,
+            "prompt_total 应含图片 token"
+        );
         let (_, _, read) = u.split_against_total(u.prompt_total_est);
         assert!(read > img_tokens / 2, "含图历史进 read 桶");
     }
@@ -763,7 +832,10 @@ mod tests {
             }]),
         };
         let toolu_est = message_tokens(&tool_use);
-        assert!(toolu_est > 100, "tool_use 参数必须计入 token，实得 {toolu_est}");
+        assert!(
+            toolu_est > 100,
+            "tool_use 参数必须计入 token，实得 {toolu_est}"
+        );
 
         // 历史 (u1, assistant tool_use) + 本轮 user：creation = 倒数第二条 = tool_use。
         let req = req_with(
@@ -771,7 +843,10 @@ mod tests {
             None,
         );
         let u = compute_structural_cache_usage(&req, 1.0, Some(1));
-        assert_eq!(u.creation_est, toolu_est, "creation 应等于 tool_use message 的 token");
+        assert_eq!(
+            u.creation_est, toolu_est,
+            "creation 应等于 tool_use message 的 token"
+        );
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(creation > 0, "修复后 cache_creation 不再塌成 0");
         assert_eq!(input + creation + read, u.prompt_total_est);
@@ -795,7 +870,10 @@ mod tests {
             None,
         );
         let u = compute_structural_cache_usage(&req, 1.0, Some(1));
-        assert!(u.prompt_total_est > tr_est, "prompt_total 应含 tool_result token");
+        assert!(
+            u.prompt_total_est > tr_est,
+            "prompt_total 应含 tool_result token"
+        );
     }
 
     #[test]
@@ -835,15 +913,35 @@ mod tests {
     fn governance_warmth_cold_then_warm_then_expired() {
         let g = MeterGovernance::new(1.0, 300);
         // 首次出现 → cold(None)，本次记 5 条
-        assert_eq!(g.observe_session("sess:a", 1000, 5), None, "首次出现应判 cold");
+        assert_eq!(
+            g.observe_session("sess:a", 1000, 5),
+            None,
+            "首次出现应判 cold"
+        );
         // TTL 内再来 → warm，返回上次条数 5；本次记 7 条
-        assert_eq!(g.observe_session("sess:a", 1200, 7), Some(5), "TTL(300)内应 warm 且返回上次条数");
+        assert_eq!(
+            g.observe_session("sess:a", 1200, 7),
+            Some(5),
+            "TTL(300)内应 warm 且返回上次条数"
+        );
         // 超 TTL → cold(缓存凉了)；本次记 9 条
-        assert_eq!(g.observe_session("sess:a", 1600, 9), None, "距上次>300s 应判 cold");
+        assert_eq!(
+            g.observe_session("sess:a", 1600, 9),
+            None,
+            "距上次>300s 应判 cold"
+        );
         // 刚刷新过,紧接着再来 → warm，返回刚记的 9
-        assert_eq!(g.observe_session("sess:a", 1700, 11), Some(9), "刷新后 TTL 内应 warm");
+        assert_eq!(
+            g.observe_session("sess:a", 1700, 11),
+            Some(9),
+            "刷新后 TTL 内应 warm"
+        );
         // 不同会话互不影响 → cold
-        assert_eq!(g.observe_session("sess:b", 1700, 3), None, "另一会话首次应 cold");
+        assert_eq!(
+            g.observe_session("sess:b", 1700, 3),
+            None,
+            "另一会话首次应 cold"
+        );
     }
 
     #[test]
@@ -900,7 +998,11 @@ mod tests {
         // cold（超 TTL，缓存确已凉）：重置基线为本次条数，不保留旧高水位——前缀整段要重建。
         let g = MeterGovernance::new(1.0, 100);
         assert_eq!(g.observe_session("key:9", 1000, 50), None); // 首次 cold，记 50
-        assert_eq!(g.observe_session("key:9", 1050, 52), Some(50), "TTL 内 warm");
+        assert_eq!(
+            g.observe_session("key:9", 1050, 52),
+            Some(50),
+            "TTL 内 warm"
+        );
         // 超 TTL → cold，基线重置为本次的 4（不因高水位 52 而保留）。
         assert_eq!(g.observe_session("key:9", 1300, 4), None, "超 TTL 应 cold");
         // 紧接着来 → warm，读到刚重置的 4（证明 cold 没保留旧高水位 52）。
@@ -930,7 +1032,10 @@ mod tests {
         let est = |m: &Message| message_tokens(m);
         let burst: i32 = est(&req.messages[2]) + est(&req.messages[3]) + est(&req.messages[4]);
         let u = compute_structural_cache_usage(&req, 1.0, Some(2));
-        assert_eq!(u.creation_est, burst, "creation 应覆盖上次见到后新增的全部中间消息");
+        assert_eq!(
+            u.creation_est, burst,
+            "creation 应覆盖上次见到后新增的全部中间消息"
+        );
         assert_eq!(u.input_est, est(&req.messages[5]), "input 仍是末条");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(creation > 0 && read > 0);
@@ -939,7 +1044,10 @@ mod tests {
         // 对比旧「倒数第二条」语义（prev_n = n-2 = 4）：creation 只一条，明显偏小。
         let old = compute_structural_cache_usage(&req, 1.0, Some(req.messages.len() - 2));
         assert_eq!(old.creation_est, est(&req.messages[4]));
-        assert!(u.creation_est > old.creation_est * 2, "多消息 burst 下 C 比旧语义计入更多 creation");
+        assert!(
+            u.creation_est > old.creation_est * 2,
+            "多消息 burst 下 C 比旧语义计入更多 creation"
+        );
     }
 
     #[test]
@@ -947,13 +1055,20 @@ mod tests {
         // warm 但 prev_n >= n-1（纯重放：上次条数 == 本次条数，无新增沉淀）→ creation=0。
         let body = "lorem ipsum ".repeat(20);
         let req = req_with(
-            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            vec![
+                msg("user", &body),
+                msg("assistant", &body),
+                msg("user", "q"),
+            ],
             None,
         );
         let u = compute_structural_cache_usage(&req, 1.0, Some(3)); // prev_n == n
         assert_eq!(u.creation_est, 0, "无新增沉淀时 creation 为 0");
         let u2 = compute_structural_cache_usage(&req, 1.0, Some(2)); // prev_n == n-1
-        assert_eq!(u2.creation_est, 0, "prev_n==n-1（末条即新增）→ 新增全是 input，creation=0");
+        assert_eq!(
+            u2.creation_est, 0,
+            "prev_n==n-1（末条即新增）→ 新增全是 input，creation=0"
+        );
     }
 
     // ---- isolation_seed ----------------------------------------------------

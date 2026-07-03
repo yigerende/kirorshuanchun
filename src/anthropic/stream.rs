@@ -2544,13 +2544,8 @@ mod tests {
 
     /// 收集同一组事件喂入 GatedStreamContext（feed_event + finish）的全部输出。
     fn run_gated(events: &[crate::kiro::model::events::Event]) -> Vec<SseEvent> {
-        let mut ctx = GatedStreamContext::new(
-            "test-model",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
+        let mut ctx =
+            GatedStreamContext::new("test-model", 100, false, HashMap::new(), test_known_tools());
         let mut out = Vec::new();
         for ev in events {
             out.extend(ctx.feed_event(ev));
@@ -2638,7 +2633,10 @@ mod tests {
 
         // 3) 除 message_start 外的事件序列必须完全一致。
         let strip_ms = |evs: &[SseEvent]| -> Vec<(String, serde_json::Value)> {
-            normalize(evs).into_iter().filter(|(n, _)| n != "message_start").collect()
+            normalize(evs)
+                .into_iter()
+                .filter(|(n, _)| n != "message_start")
+                .collect()
         };
         assert_eq!(
             strip_ms(&gated),
@@ -2651,13 +2649,8 @@ mod tests {
     /// 不能像 buffered 那样等到流结束。
     #[test]
     fn gated_releases_on_context_usage_event() {
-        let mut ctx = GatedStreamContext::new(
-            "test-model",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
+        let mut ctx =
+            GatedStreamContext::new("test-model", 100, false, HashMap::new(), test_known_tools());
         // 仅喂 contextUsageEvent：应放闸并发出 message_start（缓冲里那条）。
         let out = ctx.feed_event(&context_usage(15.0));
         assert!(
@@ -2669,13 +2662,8 @@ mod tests {
     /// gated 必须在首个可见内容事件时放闸（即便 contextUsageEvent 尚未到）。
     #[test]
     fn gated_releases_on_first_visible_content() {
-        let mut ctx = GatedStreamContext::new(
-            "test-model",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
+        let mut ctx =
+            GatedStreamContext::new("test-model", 100, false, HashMap::new(), test_known_tools());
         let out = ctx.feed_event(&assistant("first token"));
         assert!(
             out.iter().any(|e| e.event == "message_start"),
@@ -2695,7 +2683,9 @@ mod tests {
         let events = vec![context_usage(15.0), assistant("x")];
         let gated = run_gated(&events);
         let ms = gated.iter().find(|e| e.event == "message_start").unwrap();
-        let it = ms.data["message"]["usage"]["input_tokens"].as_i64().unwrap();
+        let it = ms.data["message"]["usage"]["input_tokens"]
+            .as_i64()
+            .unwrap();
         assert!(
             it > 100,
             "message_start.input_tokens 应反映 contextUsage 折算值（得到 {it}）"
@@ -3579,10 +3569,7 @@ mod tests {
         assert_eq!(coerce_param_value("false"), serde_json::json!(false));
         assert_eq!(coerce_param_value("null"), serde_json::Value::Null);
         assert_eq!(coerce_param_value("[1,2,3]"), serde_json::json!([1, 2, 3]));
-        assert_eq!(
-            coerce_param_value(r#"{"a":1}"#),
-            serde_json::json!({"a":1})
-        );
+        assert_eq!(coerce_param_value(r#"{"a":1}"#), serde_json::json!({"a":1}));
         // 前后空白容忍
         assert_eq!(coerce_param_value("  42  "), serde_json::json!(42));
     }
@@ -3590,10 +3577,7 @@ mod tests {
     #[test]
     fn test_coerce_param_value_keeps_strings() {
         // 裸字符串、含前导零的编号、路径、像 JSON 字符串字面量的值 → 保留为字符串
-        assert_eq!(
-            coerce_param_value("hello"),
-            serde_json::json!("hello")
-        );
+        assert_eq!(coerce_param_value("hello"), serde_json::json!("hello"));
         assert_eq!(
             coerce_param_value("/tmp/file.txt"),
             serde_json::json!("/tmp/file.txt")
@@ -3632,7 +3616,11 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
         assert_eq!(parsed["offset"], serde_json::json!(50), "offset 应是数字");
-        assert_eq!(parsed["enabled"], serde_json::json!(true), "enabled 应是布尔");
+        assert_eq!(
+            parsed["enabled"],
+            serde_json::json!(true),
+            "enabled 应是布尔"
+        );
     }
 
     #[test]

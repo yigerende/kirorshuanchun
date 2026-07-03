@@ -148,7 +148,7 @@ pub struct KiroCredentials {
     /// 端点名称（可选）
     ///
     /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
-    /// 端点名必须在启动时注册的端点 registry 中存在。
+    /// 端点名必须在启动时注册的端点 registry 中存在；兼容别名 "auto" / "kiro"。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
@@ -742,7 +742,10 @@ mod tests {
         assert_eq!(region_from_profile_arn(""), None);
         assert_eq!(region_from_profile_arn("not-an-arn"), None);
         assert_eq!(region_from_profile_arn("arn:aws:s3:::bucket"), None);
-        assert_eq!(region_from_profile_arn("arn:aws:codewhisperer::1:profile/P"), None);
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer::1:profile/P"),
+            None
+        );
     }
 
     #[test]
@@ -805,26 +808,28 @@ mod tests {
     #[test]
     fn test_derive_external_idp_rejects_non_whitelisted_host() {
         // 非 Microsoft 主机 → 拒绝（SSRF 防护）
-        assert!(derive_external_idp_endpoints(
-            Some("https://evil.example.com/tenant/v2.0.oid"),
-            None,
-            Some("c")
-        )
-        .is_none());
+        assert!(
+            derive_external_idp_endpoints(
+                Some("https://evil.example.com/tenant/v2.0.oid"),
+                None,
+                Some("c")
+            )
+            .is_none()
+        );
         // IP 字面量 → 拒绝
-        assert!(derive_external_idp_endpoints(
-            Some("https://127.0.0.1/tenant/v2.0"),
-            None,
-            Some("c")
-        )
-        .is_none());
+        assert!(
+            derive_external_idp_endpoints(Some("https://127.0.0.1/tenant/v2.0"), None, Some("c"))
+                .is_none()
+        );
         // 非 https → 拒绝
-        assert!(derive_external_idp_endpoints(
-            Some("http://login.microsoftonline.com/tenant/v2.0"),
-            None,
-            Some("c")
-        )
-        .is_none());
+        assert!(
+            derive_external_idp_endpoints(
+                Some("http://login.microsoftonline.com/tenant/v2.0"),
+                None,
+                Some("c")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -858,8 +863,7 @@ mod tests {
     fn test_data_plane_region() {
         // 以已解析的 profileArn 区域为准
         let mut cred = KiroCredentials::default();
-        cred.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        cred.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
         assert_eq!(cred.data_plane_region(), "eu-central-1");
 
         // 无 profileArn → 回落 us-east-1

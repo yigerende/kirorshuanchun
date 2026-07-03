@@ -499,6 +499,32 @@ export async function setRuntimeGovernanceConfig(
   return data
 }
 
+// Kiro 端点路由：首选端点 + fallback 开关（运行时热更新，无需重启）
+export interface EndpointRoutingConfig {
+  /** 首选端点名（null / 空表示未设置，回退凭据级 endpoint 或 defaultEndpoint）。 */
+  preferredEndpoint: string | null
+  /** 是否在同一凭据上尝试其余兼容端点（对齐 Kiro-Go auto 路由，并含 runtime）。 */
+  endpointFallback: boolean
+  /** 凭据未指定 endpoint 时的默认端点名（只读，构造期固定）。 */
+  defaultEndpoint: string
+  /** 本进程注册的全部可选端点值（含 auto / kiro 别名），供下拉动态渲染。 */
+  availableEndpoints: string[]
+}
+
+// 获取端点路由配置
+export async function getEndpointRoutingConfig(): Promise<EndpointRoutingConfig> {
+  const { data } = await api.get<EndpointRoutingConfig>('/config/endpoint-routing')
+  return data
+}
+
+// 更新端点路由配置（preferredEndpoint 传空串视为清除，回退默认/凭据级）
+export async function setEndpointRoutingConfig(
+  patch: Partial<Pick<EndpointRoutingConfig, 'preferredEndpoint' | 'endpointFallback'>>,
+): Promise<EndpointRoutingConfig> {
+  const { data } = await api.put<EndpointRoutingConfig>('/config/endpoint-routing', patch)
+  return data
+}
+
 // OpenAI 端点模型映射规则：客户端模型名 → 目标 Claude 模型名（全局、运行时热编辑）
 export interface ModelMappingRule {
   id: string

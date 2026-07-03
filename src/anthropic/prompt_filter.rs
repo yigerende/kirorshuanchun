@@ -122,7 +122,9 @@ pub fn apply(system: &mut Option<Vec<SystemMessage>>, ctx: &KeyContext) {
     if !(ctx.simplify_cc_prompt || ctx.strip_boundary_markers || ctx.strip_env_noise) {
         return;
     }
-    let Some(blocks) = system.as_mut() else { return };
+    let Some(blocks) = system.as_mut() else {
+        return;
+    };
     if blocks.is_empty() {
         return;
     }
@@ -176,17 +178,26 @@ mod tests {
         }
     }
     fn sys(text: &str) -> Option<Vec<SystemMessage>> {
-        Some(vec![SystemMessage { text: text.to_string(), cache_control: None }])
+        Some(vec![SystemMessage {
+            text: text.to_string(),
+            cache_control: None,
+        }])
     }
     fn text_of(s: &Option<Vec<SystemMessage>>) -> String {
         s.as_ref()
-            .map(|v| v.iter().map(|b| b.text.clone()).collect::<Vec<_>>().join("\n"))
+            .map(|v| {
+                v.iter()
+                    .map(|b| b.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .unwrap_or_default()
     }
 
     #[test]
     fn all_off_is_noop() {
-        let mut s = sys("You are Claude Code, anthropic's official CLI. # Doing tasks\ngitStatus: clean");
+        let mut s =
+            sys("You are Claude Code, anthropic's official CLI. # Doing tasks\ngitStatus: clean");
         let before = text_of(&s);
         apply(&mut s, &ctx(false, false, false));
         assert_eq!(text_of(&s), before);
@@ -222,12 +233,10 @@ mod tests {
 
     #[test]
     fn strip_env_noise_removes_section_and_lines() {
-        let mut s = sys(
-            "Keep this line.\n\
+        let mut s = sys("Keep this line.\n\
              # Environment\nOS: linux\ncwd: /home/x\n\
              # Real Heading\nkeep this too.\n\
-             gitStatus: M file.rs\nRecent commits: abc123",
-        );
+             gitStatus: M file.rs\nRecent commits: abc123");
         apply(&mut s, &ctx(false, false, true));
         let t = text_of(&s);
         assert!(t.contains("Keep this line"));
@@ -262,4 +271,3 @@ mod tests {
         assert_eq!(empty.unwrap().len(), 0);
     }
 }
-

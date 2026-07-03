@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { DatabaseZap, Filter, Shuffle, ShieldAlert, ScrollText } from 'lucide-react'
+import { DatabaseZap, Filter, Shuffle, ShieldAlert, ScrollText, Waypoints } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -18,6 +18,8 @@ import {
   useSetLogGovernanceConfig,
   useGlobalProxy,
   useSetGlobalProxy,
+  useEndpointRoutingConfig,
+  useSetEndpointRoutingConfig,
 } from '@/hooks/use-credentials'
 import { ModelMappingPanel } from '@/components/model-mapping-panel'
 import { extractErrorMessage } from '@/lib/utils'
@@ -74,6 +76,90 @@ function ToggleRow({
 }
 
 // PLACEHOLDER_SECTIONS
+
+// Kiro 端点路由（首选端点 + fallback 开关）
+function EndpointRoutingSection() {
+  const { data: cfg, isLoading } = useEndpointRoutingConfig()
+  const { mutate, isPending } = useSetEndpointRoutingConfig()
+
+  const save = (patch: Record<string, unknown>, ok: string) =>
+    mutate(patch, {
+      onSuccess: () => toast.success(ok),
+      onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
+    })
+
+  // 端点名 → 中文标签（未知名回退原样）
+  const label = (name: string): string => {
+    switch (name) {
+      case 'auto':
+        return '自动'
+      case 'kiro':
+        return 'Kiro (ide 别名)'
+      case 'ide':
+        return 'IDE'
+      case 'cli':
+        return 'CLI'
+      case 'codewhisperer':
+        return 'CodeWhisperer'
+      case 'amazonq':
+        return 'Amazon Q'
+      case 'runtime':
+        return 'Runtime (kiro.dev)'
+      default:
+        return name
+    }
+  }
+
+  const current = cfg?.preferredEndpoint ?? null
+  const available = cfg?.availableEndpoints ?? []
+
+  return (
+    <SettingSection
+      icon={<Waypoints className="h-4 w-4 text-teal-500" />}
+      title="Kiro 端点路由"
+      desc="首选上游端点与失败回退。auto 依次尝试 ide → codewhisperer → amazonq → runtime；凭据级 endpoint 优先级最高。运行时生效并持久化。"
+    >
+      <div>
+        <div className="mb-1.5 text-sm font-medium">
+          首选端点（当前 {isLoading ? '…' : current ? label(current) : '默认 ' + (cfg ? label(cfg.defaultEndpoint) : '')}）
+        </div>
+        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
+          fallback 开启时，先用首选端点，失败再按顺序尝试其余端点。cli 端点不参与回退。留空回退到默认 / 凭据级端点。
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {available.map((name) => (
+            <Button
+              key={name}
+              size="sm"
+              variant={current === name ? 'default' : 'outline'}
+              className="h-8 text-xs"
+              disabled={isPending || current === name}
+              onClick={() => save({ preferredEndpoint: name }, `首选端点已切换到「${label(name)}」`)}
+            >
+              {label(name)}
+            </Button>
+          ))}
+          <Button
+            size="sm"
+            variant={current === null ? 'default' : 'ghost'}
+            className="h-8 text-xs"
+            disabled={isPending || current === null}
+            onClick={() => save({ preferredEndpoint: '' }, '已清除首选端点（回退默认）')}
+          >
+            清除
+          </Button>
+        </div>
+      </div>
+      <ToggleRow
+        label={cfg?.endpointFallback ? '端点回退：已启用' : '端点回退：已关闭'}
+        desc="首选端点失败时，自动在同一凭据上尝试其余兼容端点。关闭则只用首选端点。"
+        checked={cfg?.endpointFallback ?? true}
+        disabled={isPending || isLoading}
+        onChange={(v) => save({ endpointFallback: v }, v ? '已开启端点回退' : '已关闭端点回退')}
+      />
+    </SettingSection>
+  )
+}
 
 // 缓存 / 配额治理
 function CacheQuotaSection() {
@@ -404,6 +490,7 @@ export function SettingsPage() {
         </p>
       </div>
       <div className="grid gap-5 lg:grid-cols-2">
+        <EndpointRoutingSection />
         <CacheQuotaSection />
         <PromptFilterSection />
         <SettingSection

@@ -155,8 +155,7 @@ impl OpenAiResponseBuilder {
                     .unwrap_or("");
                 match dtype {
                     "text_delta" => {
-                        if let Some(t) =
-                            delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
                             && !t.is_empty()
                         {
                             self.text.push_str(t);
@@ -165,8 +164,9 @@ impl OpenAiResponseBuilder {
                         }
                     }
                     "thinking_delta" => {
-                        if let Some(t) =
-                            delta.and_then(|d| d.get("thinking")).and_then(|v| v.as_str())
+                        if let Some(t) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|v| v.as_str())
                             && !t.is_empty()
                         {
                             self.reasoning.push_str(t);
@@ -480,6 +480,3 @@ mod tests {
         );
     }
 }
-
-
-

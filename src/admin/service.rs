@@ -22,14 +22,15 @@ use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, RuntimeGovernanceConfigResponse,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
+    EndpointRoutingConfigResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, RuntimeGovernanceConfigResponse,
+    SetAccountThrottleConfigRequest, SetEndpointRoutingConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -233,6 +234,8 @@ pub struct AdminService {
     /// 新建客户端 Key 时提示词过滤三开关默认值 (simplify_cc, strip_boundary, strip_env)。
     /// 运行时可改 + 持久化；仅影响新建 Key，现有 Key 不受影响。
     prompt_filter_defaults: Mutex<(bool, bool, bool)>,
+    /// 端点路由运行时配置（与 KiroProvider 共享 Arc；运行时改首选端点 / fallback 开关）。
+    endpoint_routing: Option<Arc<crate::kiro::provider::EndpointRouting>>,
 }
 
 /// Social 登录会话状态
@@ -585,6 +588,7 @@ impl AdminService {
             model_mappings: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
             prompt_filter_defaults: Mutex::new(prompt_filter_defaults),
+            endpoint_routing: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -645,6 +649,15 @@ impl AdminService {
         model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
     ) -> Self {
         self.model_mappings = model_mappings;
+        self
+    }
+
+    /// 注入端点路由运行时配置（与 KiroProvider 共享同一 Arc），用于运行时读写首选端点 / fallback 开关。
+    pub fn with_endpoint_routing(
+        mut self,
+        endpoint_routing: Option<Arc<crate::kiro::provider::EndpointRouting>>,
+    ) -> Self {
+        self.endpoint_routing = endpoint_routing;
         self
     }
 
@@ -2310,6 +2323,94 @@ impl AdminService {
         });
 
         Ok(self.get_runtime_governance_config())
+    }
+
+    /// 读取端点路由配置（首选端点 + fallback 开关 + 可选端点清单）。
+    ///
+    /// 首选端点/开关取自运行时共享的 [`EndpointRouting`]（未注入时回退 config 静态值）；
+    /// `available_endpoints` 是本进程注册的全部可选值（含 `auto` / `kiro` 别名），供 UI
+    /// 动态渲染下拉，避免前端硬编码。
+    pub fn get_endpoint_routing_config(&self) -> EndpointRoutingConfigResponse {
+        let cfg = self.token_manager.config();
+        let (preferred, fallback) = match &self.endpoint_routing {
+            Some(r) => (r.preferred(), r.fallback()),
+            None => (cfg.preferred_endpoint.clone(), cfg.endpoint_fallback),
+        };
+        // 稳定排序：auto 与 kiro 别名置顶，其余端点名按字典序，便于 UI 呈现。
+        let mut available: Vec<String> = self.known_endpoints.iter().cloned().collect();
+        available.sort_by(|a, b| {
+            fn rank(name: &str) -> u8 {
+                match name {
+                    "auto" => 0,
+                    "kiro" => 1,
+                    _ => 2,
+                }
+            }
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+        EndpointRoutingConfigResponse {
+            preferred_endpoint: preferred,
+            endpoint_fallback: fallback,
+            default_endpoint: cfg.default_endpoint.clone(),
+            available_endpoints: available,
+        }
+    }
+
+    /// 更新端点路由配置：校验取值 → 改运行时共享值（立即生效）→ 持久化 config.json。
+    /// 任一字段缺省表示不修改；`preferredEndpoint` 传空串视为清除（回退默认/凭据级）。
+    pub fn set_endpoint_routing_config(
+        &self,
+        req: SetEndpointRoutingConfigRequest,
+    ) -> Result<EndpointRoutingConfigResponse, AdminServiceError> {
+        if req.preferred_endpoint.is_none() && req.endpoint_fallback.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 preferredEndpoint 或 endpointFallback 一个字段".to_string(),
+            ));
+        }
+
+        // 归一化首选端点：Some("") → None（清除）；Some(name) → 校验必须是已注册端点或别名。
+        let normalized_preferred: Option<Option<String>> = match &req.preferred_endpoint {
+            None => None, // 不修改
+            Some(name) => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    Some(None)
+                } else if self.known_endpoints.contains(trimmed) {
+                    Some(Some(trimmed.to_string()))
+                } else {
+                    let mut valid: Vec<&str> =
+                        self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                    valid.sort_unstable();
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知首选端点 \"{}\"，可选值: {}",
+                        trimmed,
+                        valid.join(", ")
+                    )));
+                }
+            }
+        };
+
+        // 先改运行时共享值（立即对后续请求生效）
+        if let Some(routing) = &self.endpoint_routing {
+            if let Some(pref) = &normalized_preferred {
+                routing.set_preferred(pref.clone());
+            }
+            if let Some(enabled) = req.endpoint_fallback {
+                routing.set_fallback(enabled);
+            }
+        }
+
+        // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
+        self.update_config_file(|c| {
+            if let Some(pref) = &normalized_preferred {
+                c.preferred_endpoint = pref.clone();
+            }
+            if let Some(enabled) = req.endpoint_fallback {
+                c.endpoint_fallback = enabled;
+            }
+        });
+
+        Ok(self.get_endpoint_routing_config())
     }
 
     /// 获取当前模型映射规则列表（OpenAI 端点）。未注入映射表时返回空列表。

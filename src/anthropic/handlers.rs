@@ -232,7 +232,8 @@ impl RequestTracer {
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let final_endpoint = attempts.last().map(|a| a.endpoint.clone());
         let first_token_at = *self.first_token_at.lock();
-        let first_token_ms = first_token_at.map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let first_token_ms =
+            first_token_at.map(|t| t.duration_since(self.started_at).as_millis() as u64);
         // 等账号槽：从 tracer 构造（请求 setup 已完成）到首次成功 acquire。
         let credential_wait_ms = self
             .credential_acquired_at
@@ -445,7 +446,6 @@ fn classify_input_tier(input_tokens: i32) -> InputTier {
     }
 }
 
-
 /// 取 `max(contextUsage 折算值, 本地 fallback)`：contextUsage 是上游按百分比×窗口
 /// 折算的估算值，低估时会盖过本地真实转发量，导致上报 input_tokens 偏低、客户端
 /// 永不触发 auto-compact。max 保证上报量不低于本地真值，正确驱动客户端压缩。
@@ -647,8 +647,10 @@ pub(crate) fn resolve_response_cache(
     key_ctx: &KeyContext,
 ) -> Option<(super::response_cache::SharedResponseCache, String, u64)> {
     let cache = state.response_cache.as_ref()?;
-    let (enabled, ttl) =
-        cache.effective_config(key_ctx.response_cache_enabled, key_ctx.response_cache_ttl_secs);
+    let (enabled, ttl) = cache.effective_config(
+        key_ctx.response_cache_enabled,
+        key_ctx.response_cache_ttl_secs,
+    );
     if !enabled {
         return None;
     }

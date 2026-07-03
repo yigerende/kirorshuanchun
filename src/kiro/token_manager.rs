@@ -1955,8 +1955,7 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t.saturating_duration_since(now).as_secs())
                             .unwrap_or(0);
-                        soonest_cooldown =
-                            Some(soonest_cooldown.map_or(secs, |s| s.min(secs)));
+                        soonest_cooldown = Some(soonest_cooldown.map_or(secs, |s| s.min(secs)));
                     } else if !credential_matches_request(&e.credentials, model, group) {
                         mismatch += 1;
                     }
@@ -4886,7 +4885,6 @@ mod tests {
         assert_eq!(c2.disabled_reason, None, "未禁用账号不应带 reason");
     }
 
-
     #[test]
     fn test_credential_region_priority_uses_credential_auth_region() {
         // 凭据配置了 auth_region 时，应使用凭据的 auth_region
@@ -5129,8 +5127,9 @@ mod tests {
 
         let mut eu_idp = KiroCredentials::default();
         // auth 区域留空 → effective_auth_region 回落 config 的 us-east-1（模拟 Azure 租户）。
-        eu_idp.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:217422363316:profile/GNGVMQHECWM7".to_string());
+        eu_idp.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:217422363316:profile/GNGVMQHECWM7".to_string(),
+        );
 
         // 修复后的种子逻辑(与 get_usage_limits 内一致):profileArn 区域优先。
         let seed = eu_idp
@@ -5701,9 +5700,8 @@ mod tests {
         // 本测试断言满槽时新请求排队等待，需 opt-in 阻塞获取。
         let mut config = Config::default();
         config.account_acquire_blocking = true;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![cred], None, None, false).unwrap(),
-        );
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
 
         let first = manager.acquire_context(None, None).await.unwrap();
         let second = manager.acquire_context(None, None).await.unwrap();
@@ -5751,9 +5749,8 @@ mod tests {
         // 200 个并发任务必须各自最终拿到租约（满槽时排队），需 opt-in 阻塞获取。
         let mut config = Config::default();
         config.account_acquire_blocking = true;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![cred], None, None, false).unwrap(),
-        );
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
 
         // 全局观测到的最大同时在途数
         let max_seen = Arc::new(AtomicUsize::new(0));
@@ -5816,14 +5813,8 @@ mod tests {
         let mut config = Config::default();
         config.account_acquire_blocking = true;
         let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                vec![grouped_cred("a", &[])],
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
+            MultiTokenManager::new(config, vec![grouped_cred("a", &[])], None, None, false)
+                .unwrap(),
         );
 
         let first = manager.acquire_context(None, None).await.unwrap();

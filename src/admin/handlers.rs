@@ -23,11 +23,11 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
-        SetConcurrencyRequest, SetDisabledRequest, SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetConcurrencyRequest, SetDisabledRequest, SetEndpointRoutingConfigRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest, SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -596,6 +596,24 @@ pub async fn set_runtime_governance_config(
     }
 }
 
+/// GET /api/admin/config/endpoint-routing
+/// 获取端点路由配置（首选端点 + fallback 开关 + 可选端点清单）
+pub async fn get_endpoint_routing_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_endpoint_routing_config())
+}
+
+/// PUT /api/admin/config/endpoint-routing
+/// 更新端点路由配置（运行时生效 + 持久化 config.json）
+pub async fn set_endpoint_routing_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetEndpointRoutingConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_endpoint_routing_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/model-mappings
 /// 获取 OpenAI 端点模型映射规则列表
 pub async fn get_model_mappings(State(state): State<AdminState>) -> impl IntoResponse {
@@ -1119,22 +1137,19 @@ pub async fn update_client_key(
             Some(t.to_string())
         }
     });
-    if state
-        .client_keys
-        .update_meta(
-            id,
-            payload.name,
-            description,
-            group,
-            payload.cache_enabled,
-            payload.simplify_cc_prompt,
-            payload.strip_boundary_markers,
-            payload.strip_env_noise,
-            payload.response_cache_enabled,
-            payload.response_cache_ttl_secs.map(Some),
-            payload.cache_read_ratio,
-        )
-    {
+    if state.client_keys.update_meta(
+        id,
+        payload.name,
+        description,
+        group,
+        payload.cache_enabled,
+        payload.simplify_cc_prompt,
+        payload.strip_boundary_markers,
+        payload.strip_env_noise,
+        payload.response_cache_enabled,
+        payload.response_cache_ttl_secs.map(Some),
+        payload.cache_read_ratio,
+    ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (

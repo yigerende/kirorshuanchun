@@ -15,17 +15,19 @@ pub mod amazonq;
 pub mod cli;
 pub mod codewhisperer;
 pub mod ide;
+pub mod runtime;
 
 pub use amazonq::AmazonqEndpoint;
 pub use cli::CliEndpoint;
 pub use codewhisperer::CodewhispererEndpoint;
 pub use ide::IdeEndpoint;
+pub use runtime::RuntimeEndpoint;
 
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
 pub trait KiroEndpoint: Send + Sync {
-    /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
+    /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的规范取值）
     fn name(&self) -> &'static str;
 
     /// API 请求的 Content-Type（默认 application/json）

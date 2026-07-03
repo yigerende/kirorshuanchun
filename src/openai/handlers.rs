@@ -20,7 +20,7 @@ use tokio::time::interval;
 
 use crate::admin::trace_db::outcome;
 use crate::anthropic::handlers::{
-    PreparedKiroRequest, RequestTracer, RequestTraceOptions, TraceUsage, UsageRecordHook,
+    PreparedKiroRequest, RequestTraceOptions, RequestTracer, TraceUsage, UsageRecordHook,
     last_attempt_outcome, map_provider_error, prepare_kiro_request,
 };
 use crate::anthropic::middleware::{AppState, KeyContext};
@@ -161,9 +161,25 @@ pub async fn post_chat_completions(
     ));
 
     if is_stream {
-        handle_stream(provider, payload.model, prepared, hook, tracer, key_ctx.group).await
+        handle_stream(
+            provider,
+            payload.model,
+            prepared,
+            hook,
+            tracer,
+            key_ctx.group,
+        )
+        .await
     } else {
-        handle_non_stream(provider, payload.model, prepared, hook, tracer, key_ctx.group).await
+        handle_non_stream(
+            provider,
+            payload.model,
+            prepared,
+            hook,
+            tracer,
+            key_ctx.group,
+        )
+        .await
     }
 }
 
@@ -179,7 +195,11 @@ async fn handle_non_stream(
     group: Option<String>,
 ) -> Response {
     let call_result = match provider
-        .call_api(&prepared.request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(
+            &prepared.request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
@@ -200,7 +220,15 @@ async fn handle_non_stream(
     let body_bytes = match call_result.response.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            hook.record(credential_id, prepared.total_input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(
+                credential_id,
+                prepared.total_input_tokens,
+                0,
+                0,
+                0,
+                0.0,
+                "error",
+            );
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
@@ -296,7 +324,6 @@ fn finalize_stream(
     }
     out
 }
-
 
 /// `data: [DONE]` 终止帧
 fn done_frame() -> Bytes {
@@ -402,7 +429,6 @@ fn build_openai_sse_stream(
     .flatten()
 }
 
-
 /// 流式：上游字节 → StreamContext → Anthropic SseEvent → OpenAI chunk SSE。
 async fn handle_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -413,7 +439,11 @@ async fn handle_stream(
     group: Option<String>,
 ) -> Response {
     let call_result = match provider
-        .call_api_stream(&prepared.request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(
+            &prepared.request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
@@ -450,5 +480,3 @@ async fn handle_stream(
         .body(Body::from_stream(stream))
         .unwrap()
 }
-
-

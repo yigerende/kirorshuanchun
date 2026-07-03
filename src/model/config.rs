@@ -167,20 +167,25 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
+    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）。
+    /// 兼容 Kiro-Go 的 "auto" 与 "kiro"（"kiro" 等同 "ide"）。
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
     /// Preferred endpoint name when endpoint fallback is enabled.
     ///
     /// If unset, fallback order starts from `default_endpoint`. Per-credential
-    /// `endpoint` still has highest priority.
+    /// `endpoint` still has highest priority. "auto" follows Kiro-Go ordering;
+    /// "kiro" is accepted as an alias of "ide".
     #[serde(default)]
     pub preferred_endpoint: Option<String>,
 
-    /// Whether to try Kiro-Go-compatible fallback endpoints on the same credential.
+    /// Whether to try fallback endpoints on the same credential.
     ///
-    /// Default false preserves existing single-endpoint behavior.
+    /// Default true mirrors Kiro-Go auto routing and also includes the
+    /// runtime.kiro.dev route from kiro.rs-admin. This prevents a single
+    /// blocked/unreachable endpoint (for example codewhisperer) from consuming
+    /// all retry attempts before another route is tried.
     #[serde(default = "default_endpoint_fallback")]
     pub endpoint_fallback: bool,
 
@@ -401,7 +406,7 @@ fn default_endpoint() -> String {
 }
 
 fn default_endpoint_fallback() -> bool {
-    false
+    true
 }
 
 fn default_trace_enabled() -> bool {

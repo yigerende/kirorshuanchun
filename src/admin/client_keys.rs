@@ -185,9 +185,23 @@ impl ClientKeyManager {
         prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         if cache_enabled {
-            self.create_with_key_full(name, description, group, generate_client_key(), true, prompt_filters)
+            self.create_with_key_full(
+                name,
+                description,
+                group,
+                generate_client_key(),
+                true,
+                prompt_filters,
+            )
         } else {
-            self.create_with_key_full(name, description, group, generate_client_key(), false, prompt_filters)
+            self.create_with_key_full(
+                name,
+                description,
+                group,
+                generate_client_key(),
+                false,
+                prompt_filters,
+            )
         }
     }
 
@@ -841,7 +855,14 @@ mod tests {
     fn ensure_system_key_migrates_misplaced_id_to_zero() {
         // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
         let mgr = ClientKeyManager::new();
-        mgr.create_with_key_full("默认密钥".into(), None, None, "sk-kiro-abc".into(), true, (false, false, false));
+        mgr.create_with_key_full(
+            "默认密钥".into(),
+            None,
+            None,
+            "sk-kiro-abc".into(),
+            true,
+            (false, false, false),
+        );
         assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());

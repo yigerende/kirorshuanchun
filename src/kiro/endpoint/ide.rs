@@ -224,15 +224,17 @@ mod tests {
             "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(ep.host(&ctx), "codewhisperer.us-east-1.amazonaws.com");
-        assert_eq!(ep.mcp_url(&ctx), "https://codewhisperer.us-east-1.amazonaws.com/mcp");
+        assert_eq!(
+            ep.mcp_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/mcp"
+        );
     }
 
     #[test]
     fn test_external_idp_streaming_url_eu_central_1() {
         // profileArn 区域为 eu-central-1 → q.eu-central-1 主机（数据面区域取自 profileArn）
         let ep = IdeEndpoint::new();
-        let cred =
-            external_idp_cred(Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL"));
+        let cred = external_idp_cred(Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL"));
         let config = Config::default(); // 默认 region=us-east-1，必须被 profileArn 区域覆盖
         let ctx = RequestContext {
             credentials: &cred,

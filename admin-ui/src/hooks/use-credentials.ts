@@ -21,6 +21,8 @@ import {
   setLogGovernanceConfig,
   getRuntimeGovernanceConfig,
   setRuntimeGovernanceConfig,
+  getEndpointRoutingConfig,
+  setEndpointRoutingConfig,
   getModelMappings,
   setModelMappings,
   getPromptFilterDefaults,
@@ -271,6 +273,25 @@ export function useSetRuntimeGovernanceConfig() {
     mutationFn: setRuntimeGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['runtimeGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取端点路由配置（首选端点 + fallback 开关 + 可选端点清单）
+export function useEndpointRoutingConfig() {
+  return useQuery({
+    queryKey: ['endpointRoutingConfig'],
+    queryFn: getEndpointRoutingConfig,
+  })
+}
+
+// 更新端点路由配置
+export function useSetEndpointRoutingConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setEndpointRoutingConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['endpointRoutingConfig'] })
     },
   })
 }

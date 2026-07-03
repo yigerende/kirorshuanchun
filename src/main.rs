@@ -13,11 +13,13 @@ pub mod token;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clap::Parser;
 use axum::serve::ListenerExt;
-use kiro::endpoint::{AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint};
+use clap::Parser;
+use kiro::endpoint::{
+    AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
-use kiro::provider::KiroProvider;
+use kiro::provider::{EndpointRouting, KiroProvider};
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
@@ -129,10 +131,15 @@ async fn main() {
         endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
         let amazonq = AmazonqEndpoint::new();
         endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
+        let runtime = RuntimeEndpoint::new();
+        endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
     }
 
+    let is_known_endpoint_config =
+        |name: &str| matches!(name, "auto" | "kiro") || endpoints.contains_key(name);
+
     // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
+    if !is_known_endpoint_config(&config.default_endpoint) {
         tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
         std::process::exit(1);
     }
@@ -140,9 +147,9 @@ async fn main() {
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
         let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
+        if !is_known_endpoint_config(name) {
             tracing::error!(
-                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}，兼容别名: auto/kiro）",
                 cred.id,
                 name,
                 endpoints.keys().collect::<Vec<_>>()
@@ -151,7 +158,8 @@ async fn main() {
         }
     }
 
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    let mut endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    endpoint_names.extend(["auto".to_string(), "kiro".to_string()]);
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -166,13 +174,18 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 端点路由运行时配置（首选端点 + fallback 开关）。以 Arc 在 provider 与 AdminService
+    // 间共享，Admin 面板改动后运行时立即生效、无需重启。
+    let endpoint_routing = Arc::new(EndpointRouting::new(
+        config.preferred_endpoint.clone(),
+        config.endpoint_fallback,
+    ));
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-        config.preferred_endpoint.clone(),
-        config.endpoint_fallback,
+        endpoint_routing.clone(),
     );
 
     // 初始化 count_tokens 配置
@@ -266,12 +279,10 @@ async fn main() {
 
     // 缓存计量运行时治理：持有全局命中率 R + 缓存热度 TTL（按会话判 warm/cold）。
     // 比旧的有状态 CacheMeter 轻：只存 session→last_seen，不存全前缀哈希链、不落盘。
-    let meter_governance = std::sync::Arc::new(
-        anthropic::cache_metering::MeterGovernance::new(
-            config.cache_read_ratio,
-            config.cache_meter_ttl_secs,
-        ),
-    );
+    let meter_governance = std::sync::Arc::new(anthropic::cache_metering::MeterGovernance::new(
+        config.cache_read_ratio,
+        config.cache_meter_ttl_secs,
+    ));
 
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
     // 这样可经 Admin API 运行时开启而无需重启；全局开关 + TTL 作为运行时原子值存于缓存内，
@@ -285,9 +296,9 @@ async fn main() {
 
     // 模型映射表：OpenAI 端点客户端模型名 → 目标 Claude 模型名（全局，运行时热编辑）。
     // 始终构造（即使空表），便于经 Admin API 运行时增删而无需重启。
-    let model_mappings = std::sync::Arc::new(
-        openai::model_mapping::ModelMappings::new(config.model_mappings.clone()),
-    );
+    let model_mappings = std::sync::Arc::new(openai::model_mapping::ModelMappings::new(
+        config.model_mappings.clone(),
+    ));
 
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
@@ -323,7 +334,8 @@ async fn main() {
                     )
                     .with_response_cache(Some(response_cache.clone()))
                     .with_meter_governance(Some(meter_governance.clone()))
-                    .with_model_mappings(Some(model_mappings.clone()));
+                    .with_model_mappings(Some(model_mappings.clone()))
+                    .with_endpoint_routing(Some(endpoint_routing.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -418,7 +430,8 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
             "adminApiKey": admin_api_key,
             "region": "us-east-1",
             "tlsBackend": "rustls",
-            "defaultEndpoint": "ide"
+            "defaultEndpoint": "ide",
+            "endpointFallback": true
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)

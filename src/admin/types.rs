@@ -542,6 +542,33 @@ pub struct SetRuntimeGovernanceConfigRequest {
     pub cache_meter_ttl_secs: Option<u64>,
 }
 
+/// 端点路由配置响应：首选端点 + fallback 开关 + 可选端点清单。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointRoutingConfigResponse {
+    /// 当前首选端点名（`None` 表示未设置——回退凭据级 endpoint 或 defaultEndpoint）。
+    pub preferred_endpoint: Option<String>,
+    /// 是否在同一凭据上尝试其余 Kiro-Go 兼容端点（auto 路由 + runtime）。
+    pub endpoint_fallback: bool,
+    /// 默认端点名（凭据未指定且未设首选时使用）。构造期不可变，仅供 UI 展示。
+    pub default_endpoint: String,
+    /// 本进程注册的全部可选端点值（含 `auto` / `kiro` 别名），供 UI 动态渲染下拉。
+    pub available_endpoints: Vec<String>,
+}
+
+/// 更新端点路由配置（字段缺省表示不修改）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointRoutingConfigRequest {
+    /// 首选端点名；缺省不修改，空串视为清除（回退默认/凭据级）。
+    /// 取值须为已注册端点或别名（auto / kiro / ide / cli / codewhisperer / amazonq / runtime）。
+    #[serde(default)]
+    pub preferred_endpoint: Option<String>,
+    /// fallback 开关；缺省不修改。
+    #[serde(default)]
+    pub endpoint_fallback: Option<bool>,
+}
+
 /// 新建 Key 提示词过滤默认值（响应）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1242,7 +1269,10 @@ mod tests {
     #[test]
     fn response_cache_enabled_three_state_wire() {
         let absent: UpdateClientKeyRequest = serde_json::from_str(r#"{"name":"k"}"#).unwrap();
-        assert_eq!(absent.response_cache_enabled, None, "字段缺省应为 None（不变更）");
+        assert_eq!(
+            absent.response_cache_enabled, None,
+            "字段缺省应为 None（不变更）"
+        );
 
         let null: UpdateClientKeyRequest =
             serde_json::from_str(r#"{"responseCacheEnabled":null}"#).unwrap();
@@ -1258,6 +1288,10 @@ mod tests {
 
         let off: UpdateClientKeyRequest =
             serde_json::from_str(r#"{"responseCacheEnabled":false}"#).unwrap();
-        assert_eq!(off.response_cache_enabled, Some(Some(false)), "false 强制关");
+        assert_eq!(
+            off.response_cache_enabled,
+            Some(Some(false)),
+            "false 强制关"
+        );
     }
 }

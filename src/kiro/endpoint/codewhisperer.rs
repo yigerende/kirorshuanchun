@@ -234,8 +234,7 @@ mod tests {
     fn test_non_us_east_1_collapses_to_q_regional_host() {
         // 非 us-east-1 区域 → q.{region}（不存在 codewhisperer.{region}）
         let ep = CodewhispererEndpoint::new();
-        let cred =
-            external_idp_cred(Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL"));
+        let cred = external_idp_cred(Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL"));
         let config = Config::default();
         let ctx = RequestContext {
             credentials: &cred,
