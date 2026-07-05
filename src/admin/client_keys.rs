@@ -655,13 +655,9 @@ fn default_cache_enabled() -> bool {
 
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let body: String = (0..32)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
+    // OS CSPRNG（security::secure_token_urlsafe）而非 fastrand——对外分发的凭据须密码学安全。
+    // 24 字节 → URL-safe base64 32 字符，熵充足。
+    let body = crate::security::secure_token_urlsafe(24);
     format!("{}{}", CLIENT_KEY_PREFIX, body)
 }
 

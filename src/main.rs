@@ -7,6 +7,7 @@ mod image_resize;
 mod kiro;
 mod model;
 mod openai;
+mod security;
 mod text_truncate;
 pub mod token;
 
@@ -109,7 +110,10 @@ async fn main() {
     });
 
     if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+        tracing::info!(
+            "已配置 HTTP 代理: {}",
+            security::redact_proxy_url(config.proxy_url.as_ref().unwrap())
+        );
     }
 
     // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
@@ -488,13 +492,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
     }
 }
 
-/// 生成一段长度为 `len` 的字母数字随机字符串，用于默认 API Key
+/// 生成一段长度约为 `len` 的随机 token，用于默认 API Key。
+/// 使用 OS CSPRNG（`security::secure_token_urlsafe`）而非 fastrand——默认凭据须密码学安全。
+/// 输出为 URL-safe base64（可能含 `-`/`_`），长度 ≥ len。
 fn random_token(len: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    (0..len)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
+    // base64 无填充编码后长度约为 ceil(bytes*4/3)，取 bytes≈len*3/4 使输出长度贴近 len 且不短于它。
+    security::secure_token_urlsafe(len.max(16))
 }

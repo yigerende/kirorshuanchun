@@ -789,7 +789,12 @@ impl KiroProvider {
                     .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     for (k, v) in request.headers() {
-                        tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                        let val = v.to_str().unwrap_or("<binary>");
+                        tracing::debug!(
+                            "  header {}: {}",
+                            k,
+                            crate::security::redact_header_value(k.as_str(), val)
+                        );
                     }
                 }
                 let response = match http_client.execute(request).await {
