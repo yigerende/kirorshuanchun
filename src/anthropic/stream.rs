@@ -687,6 +687,19 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
 /// 返回的 content block 形态与调用方现有约定一致：
 ///   - 文本：`{"type":"text","text": "..."}`
 ///   - 工具：`{"type":"tool_use","id":"toolu_...","name":"...","input": {...}}`
+/// 校验并解析从 `<invoke>` 块捞回的工具入参 JSON。
+///
+/// 移植自 Kiro-RS-Tool 的结构化错误理念：只有携带**可解析** JSON（或空/纯空白，代表无参）
+/// 的块才算干净的工具调用。上游在大参数中途被截断产生的半截/非法 JSON 返回 `None`，让调用方
+/// 把整块降级为文本，而不是像旧逻辑那样静默当成空参 `{}` 转发（会导致工具以空参执行）。
+fn salvaged_tool_input(input_json: &str) -> Option<serde_json::Value> {
+    let trimmed = input_json.trim();
+    if trimmed.is_empty() {
+        return Some(serde_json::json!({})); // 无参工具调用，合法
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).ok()
+}
+
 /// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
 ///
 /// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
@@ -741,17 +754,27 @@ pub(crate) fn extract_invoke_content_blocks(
             .as_ref()
             .map(|(n, _)| known_tool_names.contains(n))
             .unwrap_or(false);
+        // ②b 结构化入参校验（移植自 Kiro-RS-Tool 的结构化错误理念）：真泄漏必须携带可解析的
+        // JSON 入参。上游在参数中途被截断产生的半截/非法 JSON 不能被当作空参 tool_use 转发
+        // （否则工具会以空参执行）；此时判定为「非干净工具调用」，落到下方文本分支整块保留为
+        // 文本，而非旧逻辑的静默 `{}`。空/纯空白入参仍合法（工具可无参数）。
+        let salvaged_input = parsed
+            .as_ref()
+            .and_then(|(_, input_json)| salvaged_tool_input(input_json));
 
-        if invoke_looks_like_real_leak(stripped_before) && !fence_after_before && name_known {
+        if invoke_looks_like_real_leak(stripped_before)
+            && !fence_after_before
+            && name_known
+            && salvaged_input.is_some()
+        {
             // 真泄漏：保留剥过 stray token 的前文（推进围栏），再产出结构化 tool_use。
             if !stripped_before.is_empty() {
                 advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
                 pending_text.push_str(stripped_before);
             }
             push_text(&mut blocks, &mut pending_text);
-            let (name, input_json) = parsed.expect("parsed is Some when name_known");
-            let input: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
+            let (name, _) = parsed.expect("parsed is Some when name_known");
+            let input = salvaged_input.expect("salvaged_input is Some (checked in guard)");
             // Restore the original (client-facing) tool name: long names (>63) are shortened
             // before being sent upstream, so the model may leak the SHORT name. The host
             // matches on the original name — mirror synthesize_tool_use's restoration.
@@ -1525,9 +1548,15 @@ impl StreamContext {
                                 .as_ref()
                                 .map(|(n, _)| self.known_tool_names.contains(n))
                                 .unwrap_or(false);
+                            // 结构化入参校验（同非流式路径）：半截/非法 JSON 不合成空参 tool_use，
+                            // 整块降级为文本。当前 parse_invoke_block 自建 JSON 恒合法，此为防御性护栏。
+                            let salvaged_input = parsed
+                                .as_ref()
+                                .and_then(|(_, input_json)| salvaged_tool_input(input_json));
                             if invoke_looks_like_real_leak(before)
                                 && !fence_after_before
                                 && name_known
+                                && salvaged_input.is_some()
                             {
                                 // 真泄漏：吐块前文本（剥掉尾部独立的 call/count 行）+ 合成 tool_use
                                 if !before.is_empty() {
@@ -2736,6 +2765,22 @@ mod tests {
                 .any(|b| b["type"] == "text" && b["text"] == "call\n"),
             "stray token line must be stripped"
         );
+    }
+
+    #[test]
+    fn salvaged_tool_input_accepts_valid_and_empty_rejects_broken() {
+        // 合法 JSON → Some(值)
+        assert_eq!(
+            salvaged_tool_input(r#"{"cmd":"ls"}"#),
+            Some(serde_json::json!({"cmd":"ls"}))
+        );
+        // 空/纯空白 → Some({})，代表无参工具调用（合法）
+        assert_eq!(salvaged_tool_input(""), Some(serde_json::json!({})));
+        assert_eq!(salvaged_tool_input("   \n"), Some(serde_json::json!({})));
+        // 半截/非法 JSON → None（调用方据此降级为文本，不发空参 tool_use）
+        assert_eq!(salvaged_tool_input(r#"{"cmd":"l"#), None);
+        assert_eq!(salvaged_tool_input(r#"{"a":1,"#), None);
+        assert_eq!(salvaged_tool_input("not json at all"), None);
     }
 
     #[test]
