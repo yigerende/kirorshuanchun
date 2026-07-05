@@ -280,6 +280,23 @@ impl EffortTier {
     }
 }
 
+/// 从 `thinking.budget_tokens` 推导 effort 档位（移植自 Kiro-RS-Tool 的 `effort_from_budget_tokens`）。
+///
+/// 用于 adaptive 思考但客户端未显式给 `output_config.effort` 时，按思考预算高低选择档位，
+/// 取代旧的硬编码 `"high"`。阈值与 Tool 一致：≤4k→low，≤16k→medium，≤64k→high，更高→xhigh。
+///
+/// 注意 kiro.rs 的 `budget_tokens` 上限为 24576（见 types.rs `MAX_BUDGET_TOKENS`），故本函数在
+/// kiro.rs 实际取值范围内最高只会产出 `High`，不会到 `XHigh`——保持保守，契合黑名单前向兼容姿态。
+/// 且默认预算 20000 → `High`，与旧硬编码 `"high"` 完全一致；细化仅对更小预算生效。
+fn effort_from_budget_tokens(tokens: i32) -> EffortTier {
+    match tokens {
+        i32::MIN..=4_000 => EffortTier::Low,
+        4_001..=16_000 => EffortTier::Medium,
+        16_001..=64_000 => EffortTier::High,
+        _ => EffortTier::XHigh,
+    }
+}
+
 fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String> {
     let trimmed = raw_effort.trim();
     if trimmed.is_empty() {
@@ -1107,11 +1124,17 @@ fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<Str
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
+            // 优先用客户端显式 effort；缺省时从 budget_tokens 推导档位（而非旧的硬编码 "high"），
+            // 再经 model 归一化（含 xhigh 黑名单降级）。默认预算 20000→high，与旧行为一致。
             let effort = req
                 .output_config
                 .as_ref()
                 .and_then(|c| normalize_effort_for_model(model_id, &c.effort))
-                .unwrap_or_else(|| "high".to_string());
+                .unwrap_or_else(|| {
+                    let derived = effort_from_budget_tokens(t.budget_tokens);
+                    normalize_effort_for_model(model_id, derived.as_str())
+                        .unwrap_or_else(|| EffortTier::High.as_str().to_string())
+                });
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -1607,6 +1630,59 @@ mod tests {
             budget_tokens: 20000,
         });
         req
+    }
+
+    #[test]
+    fn test_effort_from_budget_tokens_thresholds() {
+        assert_eq!(effort_from_budget_tokens(1_000), EffortTier::Low);
+        assert_eq!(effort_from_budget_tokens(4_000), EffortTier::Low);
+        assert_eq!(effort_from_budget_tokens(4_001), EffortTier::Medium);
+        assert_eq!(effort_from_budget_tokens(16_000), EffortTier::Medium);
+        assert_eq!(effort_from_budget_tokens(16_001), EffortTier::High);
+        assert_eq!(effort_from_budget_tokens(64_000), EffortTier::High);
+        assert_eq!(effort_from_budget_tokens(64_001), EffortTier::XHigh);
+        // kiro.rs 默认预算 20000 → High(与旧硬编码 "high" 等价,保证无回归)
+        assert_eq!(effort_from_budget_tokens(20_000), EffortTier::High);
+    }
+
+    #[test]
+    fn test_adaptive_thinking_derives_effort_from_budget_when_no_explicit_effort() {
+        use super::super::types::{OutputConfig, Thinking};
+        // adaptive + 无显式 effort + 小预算(3000) → 应推导出 low(而非旧硬编码 high)
+        let mut req = minimal_request_with_output_config("claude-opus-4.6");
+        req.output_config = Some(OutputConfig {
+            effort: String::new(), // 空 effort,触发 budget 推导
+        });
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 3000,
+        });
+        let prefix = generate_thinking_prefix(&req, "claude-opus-4.6").unwrap();
+        assert!(
+            prefix.contains("<thinking_effort>low</thinking_effort>"),
+            "small budget should derive low, got: {}",
+            prefix
+        );
+    }
+
+    #[test]
+    fn test_adaptive_thinking_default_budget_still_high() {
+        use super::super::types::{OutputConfig, Thinking};
+        // 默认预算 20000 + 无显式 effort → 仍为 high,证明对典型请求零回归
+        let mut req = minimal_request_with_output_config("claude-opus-4.6");
+        req.output_config = Some(OutputConfig {
+            effort: String::new(),
+        });
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        let prefix = generate_thinking_prefix(&req, "claude-opus-4.6").unwrap();
+        assert!(
+            prefix.contains("<thinking_effort>high</thinking_effort>"),
+            "default budget must stay high, got: {}",
+            prefix
+        );
     }
 
     #[test]
