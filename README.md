@@ -106,7 +106,8 @@ docker compose logs --tail=200 kiro-rs
   "adminApiKey": "sk-admin-...",
   "region": "us-east-1",
   "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "endpointFallback": true
 }
 ```
 
@@ -273,7 +274,8 @@ Admin API 鉴权同样支持：
   "adminApiKey": "sk-admin-change-me",
   "region": "us-east-1",
   "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "endpointFallback": true
 }
 ```
 
@@ -288,7 +290,9 @@ Admin API 鉴权同样支持：
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
-| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点（`ide` / `cli` / `codewhisperer`） |
+| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点（`ide` / `cli` / `codewhisperer` / `amazonq` / `runtime`；兼容 `auto` / `kiro`，其中 `kiro` 等同 `ide`） |
+| `preferredEndpoint` | 无 | 开启 endpoint fallback 时优先尝试的端点；可填 `auto` 使用 Kiro-Go 顺序，未配置时从 `defaultEndpoint` 开始 |
+| `endpointFallback` | `true` | 同一凭据上游请求失败时是否按 `ide → codewhisperer → amazonq → runtime` 顺序尝试其它端点；可避免某个主机不可达时反复打同一路线 |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
@@ -412,7 +416,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
-| `endpoint` | `ide` / `cli` / `codewhisperer`，未填使用 `config.defaultEndpoint` |
+| `endpoint` | `ide` / `cli` / `codewhisperer` / `amazonq` / `runtime` / `auto` / `kiro`，未填使用 `config.defaultEndpoint` |
 
 <a id="models"></a>
 ## 模型
