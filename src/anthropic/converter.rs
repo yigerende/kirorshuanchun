@@ -40,6 +40,34 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // 移除 $schema（kiro API 不接受此字段，且 Draft 2020-12 声明会触发校验失败）
     obj.remove("$schema");
 
+    // 顶层不支持 oneOf/allOf/anyOf（上游 Anthropic/Bedrock 明确拒绝：
+    // "input_schema does not support oneOf, allOf, or anyOf at the top level"）。
+    // 把各分支 object 的 properties 合并到顶层 properties，再剥离组合器关键字，
+    // 保证顶层是干净的 type:object 形态。嵌套（property 级）的组合器上游接受，
+    // 由 normalize_property_schema 处理，此处不动。分支专属字段不强制 required
+    // （union 语义下无法要求某一分支的字段）。
+    for key in ["oneOf", "allOf", "anyOf"] {
+        let Some(serde_json::Value::Array(branches)) = obj.remove(key) else {
+            continue;
+        };
+        for branch in branches {
+            let serde_json::Value::Object(bobj) = branch else {
+                continue;
+            };
+            let Some(serde_json::Value::Object(bprops)) = bobj.get("properties") else {
+                continue;
+            };
+            let entry = obj
+                .entry("properties".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(pmap) = entry {
+                for (k, v) in bprops {
+                    pmap.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+
     // type（必须是字符串）
     if !obj
         .get("type")
@@ -72,16 +100,19 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         }
     }
 
-    // required（必须是 string 数组）
-    let required = match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect(),
-        ),
-        _ => serde_json::Value::Array(Vec::new()),
+    // required 必须是【非空】string 数组，否则 Kiro 报 "Improperly formed request"
+    // （对齐 Kiro-Go translator.go::cleanSchema 的注释与行为）：空/null/非数组一律【省略】，
+    // 绝不写入空 `required: []`（这正是旧行为的 REQUEST_BODY_INVALID 根因）。
+    let required: Vec<serde_json::Value> = match obj.remove("required") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+            .collect(),
+        _ => Vec::new(),
     };
-    obj.insert("required".to_string(), required);
+    if !required.is_empty() {
+        obj.insert("required".to_string(), serde_json::Value::Array(required));
+    }
 
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
@@ -109,6 +140,15 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     obj.remove("$schema");
+
+    // 嵌套 required 若为空数组/null/非数组则移除（同顶层，避免 "Improperly formed request"）。
+    match obj.get("required") {
+        Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {}
+        Some(_) => {
+            obj.remove("required");
+        }
+        None => {}
+    }
 
     // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
     if obj
@@ -1805,6 +1845,50 @@ mod tests {
             Some("xhigh"),
             "unknown future models should keep recognized effort values"
         );
+    }
+
+    #[test]
+    fn test_normalize_schema_omits_empty_required() {
+        // BUG #2: 空 required 会被 Kiro 拒为 "Improperly formed request"。
+        // 无 required 的 schema → 输出不得含 required 键。
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}}
+        }));
+        assert!(
+            out.get("required").is_none(),
+            "empty/absent required must be omitted, not inserted as []: {out}"
+        );
+        // 显式空数组同样省略。
+        let out2 = normalize_json_schema(serde_json::json!({
+            "type": "object", "properties": {}, "required": []
+        }));
+        assert!(out2.get("required").is_none(), "explicit [] must be dropped");
+        // 非空 required 保留。
+        let out3 = normalize_json_schema(serde_json::json!({
+            "type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]
+        }));
+        assert_eq!(
+            out3.get("required"),
+            Some(&serde_json::json!(["x"])),
+            "non-empty required must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_normalize_schema_strips_top_level_combinators() {
+        // BUG #1: 顶层 oneOf/allOf/anyOf 被上游拒绝，须剥离并把分支 properties 合并到顶层。
+        let out = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+                {"type": "object", "properties": {"b": {"type": "number"}}}
+            ]
+        }));
+        assert!(out.get("oneOf").is_none(), "oneOf must be stripped");
+        assert!(out.get("allOf").is_none() && out.get("anyOf").is_none());
+        assert_eq!(out.get("type"), Some(&serde_json::json!("object")));
+        let props = out.get("properties").and_then(|p| p.as_object()).unwrap();
+        assert!(props.contains_key("a") && props.contains_key("b"), "branch props merged: {out}");
     }
 
     #[test]
