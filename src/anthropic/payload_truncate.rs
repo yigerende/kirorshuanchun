@@ -68,6 +68,13 @@ fn converted_payload_bytes(result: &ConversionResult) -> usize {
     serde_json::to_string(&probe).map(|s| s.len()).unwrap_or(0)
 }
 
+/// Serialized byte size of one Anthropic message — a cheap per-turn proxy for that turn's converted
+/// contribution. Used to size the trim in a **single pass** (scaled by the observed Anthropic→Kiro
+/// expansion ratio) instead of reconverting to re-measure after every drop. Failure → 0.
+fn anthropic_msg_bytes(msg: &Message) -> usize {
+    serde_json::to_string(msg).map(|s| s.len()).unwrap_or(0)
+}
+
 /// True if an Anthropic message is a pure tool_result turn (its `content` array holds only
 /// `tool_result` blocks). Such a turn must never become the new oldest kept turn: its paired
 /// `tool_use` lives in the dropped region, so the converter would strip the orphan and the turn
@@ -122,31 +129,69 @@ pub fn convert_within_limit(
     payload: &mut MessagesRequest,
     cfg: &PayloadLimitConfig,
 ) -> Result<ConversionResult, ConversionError> {
+    convert_within_limit_counted(payload, cfg).map(|(result, _)| result)
+}
+
+/// Inner impl exposing the number of `convert_request` calls made, for the "≤ 2 conversions" test
+/// guard. See [`convert_within_limit`] for behavior.
+fn convert_within_limit_counted(
+    payload: &mut MessagesRequest,
+    cfg: &PayloadLimitConfig,
+) -> Result<(ConversionResult, usize), ConversionError> {
+    let mut conversions = 1;
     let mut result = convert_request(payload)?;
     if cfg.max_bytes == 0 {
-        return Ok(result);
+        return Ok((result, conversions));
     }
     let before = converted_payload_bytes(&result);
     if before <= cfg.max_bytes {
-        return Ok(result);
+        return Ok((result, conversions));
     }
 
-    for _ in 0..MAX_TRIM_ITERS {
-        let cur = converted_payload_bytes(&result);
-        if cur <= cfg.max_bytes {
+    // Single-pass sizing: instead of reconverting to re-measure after each drop, estimate the trim
+    // once from per-message byte sizes scaled by the observed Anthropic→Kiro expansion ratio, drop
+    // that many oldest turns, then reconvert **once** to verify (and let the pairing cleanup run).
+    // A small bounded correction loop follows only if the estimate undershot — normally never taken.
+    let msg_bytes: Vec<usize> = payload.messages.iter().map(anthropic_msg_bytes).collect();
+    let anthropic_total: usize = msg_bytes.iter().sum::<usize>().max(1);
+    // converted_total / anthropic_total ≈ how many Kiro bytes each Anthropic byte expands to.
+    let over_converted = before - cfg.max_bytes;
+    // Convert the converted-space overage back into Anthropic-space bytes to drop from the head.
+    let over_anthropic = ((over_converted as u128 * anthropic_total as u128)
+        / before.max(1) as u128) as usize;
+    // Walk oldest→newest accumulating message bytes until we've covered the target drop; that count
+    // is how many oldest turns to shed. `drop_oldest_turns` still enforces MIN_RECENT_TURNS and the
+    // pure-tool_result head guard, so an over-estimate here can never cut into the recent window.
+    let trimmable = payload.messages.len().saturating_sub(MIN_RECENT_TURNS);
+    let mut acc = 0usize;
+    let mut est = 0usize;
+    for &b in msg_bytes.iter().take(trimmable) {
+        if acc >= over_anthropic {
             break;
         }
-        if payload.messages.len() <= MIN_RECENT_TURNS {
-            break; // cannot trim further without touching the recent window / current message
-        }
-        // Estimate how many oldest turns to drop from the Kiro overage, scaled by per-turn size.
-        let over = cur - cfg.max_bytes;
-        let avg_turn = (cur / payload.messages.len().max(1)).max(1);
-        let est = (over / avg_turn) + 1;
-        if !drop_oldest_turns(&mut payload.messages, est) {
+        acc += b;
+        est += 1;
+    }
+    est = est.max(1);
+
+    if drop_oldest_turns(&mut payload.messages, est) {
+        result = convert_request(payload)?;
+        conversions += 1;
+    }
+
+    // Bounded correction: if the single-pass estimate still left us over (uneven turn sizes), shed
+    // one turn at a time. Capped by MAX_TRIM_ITERS as a safety bound; normally not entered at all.
+    let mut iters = 0;
+    while converted_payload_bytes(&result) > cfg.max_bytes
+        && payload.messages.len() > MIN_RECENT_TURNS
+        && iters < MAX_TRIM_ITERS
+    {
+        if !drop_oldest_turns(&mut payload.messages, 1) {
             break;
         }
         result = convert_request(payload)?;
+        conversions += 1;
+        iters += 1;
     }
 
     let after = converted_payload_bytes(&result);
@@ -155,9 +200,10 @@ pub fn convert_within_limit(
         after_bytes = after,
         max_bytes = cfg.max_bytes,
         remaining_messages = payload.messages.len(),
-        "整体 payload 超字节上限，已丢弃最旧历史（转换前裁剪，配对清理在转换时兜底）"
+        conversions,
+        "整体 payload 超字节上限，已丢弃最旧历史（单趟定位丢弃轮数，转换前裁剪，配对清理在转换时兜底）"
     );
-    Ok(result)
+    Ok((result, conversions))
 }
 
 #[cfg(test)]
@@ -324,6 +370,55 @@ mod tests {
         let mut p = req(msgs);
         let r = convert_within_limit(&mut p, &cfg(100_000)).unwrap();
         assert_pairing_valid(&r);
+    }
+
+    #[test]
+    fn over_budget_converges_in_two_conversions() {
+        // P0: uniform-ish turns → single-pass sizing lands under cap on the first drop, so exactly
+        // 2 convert_request calls (initial measure + one reconvert). No 12-iteration loop.
+        let mut msgs = vec![user_text("initial task")];
+        for i in 0..60 {
+            msgs.push(assistant_text(&format!("reply {i} {}", "a".repeat(8_000))));
+            msgs.push(user_text(&format!("followup {i} {}", "b".repeat(8_000))));
+        }
+        msgs.push(user_text("final question"));
+        let mut p = req(msgs);
+        let cap = 200_000;
+        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(cap)).unwrap();
+        assert_pairing_valid(&r);
+        assert!(
+            converted_payload_bytes(&r) <= cap || p.messages.len() <= MIN_RECENT_TURNS,
+            "should be under cap after trim"
+        );
+        assert!(
+            conversions <= 2,
+            "single-pass sizing must converge in ≤2 conversions, got {conversions}"
+        );
+    }
+
+    #[test]
+    fn tool_heavy_over_budget_bounded_conversions() {
+        // Even with uneven tool_use/tool_result turns, must stay well under the old 12-iter loop.
+        let mut msgs = vec![user_text("task")];
+        for i in 0..40 {
+            msgs.push(assistant_tool_use(&format!("t_{i}"), &"a".repeat(9_000)));
+            msgs.push(user_tool_result(&format!("t_{i}"), &"b".repeat(9_000)));
+        }
+        msgs.push(user_text("status?"));
+        let mut p = req(msgs);
+        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(120_000)).unwrap();
+        assert_pairing_valid(&r);
+        assert!(
+            conversions <= 4,
+            "tool-heavy trim should stay bounded, got {conversions}"
+        );
+    }
+
+    #[test]
+    fn under_budget_single_conversion() {
+        let mut p = req(vec![user_text("short"), assistant_text("ok"), user_text("q")]);
+        let (_r, conversions) = convert_within_limit_counted(&mut p, &cfg(640_000)).unwrap();
+        assert_eq!(conversions, 1, "under budget = exactly one convert");
     }
 
     #[test]
