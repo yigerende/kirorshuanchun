@@ -3,11 +3,39 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+
+/// 累计「泄漏的 `<invoke>` 工具调用被打捞回结构化 tool_use」的次数（进程级）。
+///
+/// 打捞路径（非流式 `extract_invoke_content_blocks` / 流式 `drain_invoke_sniff_buffer`）本是
+/// Opus 长上下文退化时把工具调用吐成 `<invoke>` 文本的降级兜底。此前该事件被静默处理，
+/// 无从得知发生频率。此计数器 + 每次的 `tracing::warn`（带工具名）让降级可观测：
+/// 日志聚合可直接统计泄漏频率、并看出**哪些工具**最常泄漏（用于评估是否值得做工具语义映射）。
+static SALVAGED_LEAK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 记录一次「泄漏 tool_use 被打捞」：自增计数器并打 warn（带还原后的客户端工具名）。
+fn record_salvaged_leak(tool_name: &str) {
+    let n = SALVAGED_LEAK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        tool = %tool_name,
+        salvaged_leak_total = n,
+        "打捞回泄漏的 <invoke> 工具调用（上游把 tool_use 吐成了文本，已还原为结构化）"
+    );
+}
+
+/// 读取进程启动至今的打捞总次数（预留给 /admin 指标端点只读展示）。
+///
+/// 当前决策所需的频率/工具分布数据已由每次打捞的 `tracing::warn`（含 `tool` +
+/// `salvaged_leak_total`）提供，日志聚合即可统计；此 getter 供后续接入指标端点时零成本使用。
+#[allow(dead_code)]
+pub(crate) fn salvaged_leak_count() -> u64 {
+    SALVAGED_LEAK_COUNT.load(Ordering::Relaxed)
+}
 
 /// thinking 块的 signature 占位字符串
 ///
@@ -779,6 +807,7 @@ pub(crate) fn extract_invoke_content_blocks(
             // before being sent upstream, so the model may leak the SHORT name. The host
             // matches on the original name — mirror synthesize_tool_use's restoration.
             let name = tool_name_map.get(&name).cloned().unwrap_or(name);
+            record_salvaged_leak(&name);
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
             blocks.push(serde_json::json!({
                 "type": "tool_use",
@@ -1565,6 +1594,13 @@ impl StreamContext {
                                 // parsed 在上面已确认是 Some 且 name_known
                                 let (name, input_json) =
                                     parsed.expect("parsed is Some when name_known");
+                                // 记录还原后的客户端工具名（与 synthesize_tool_use 内部一致的还原）。
+                                let client_name = self
+                                    .tool_name_map
+                                    .get(&name)
+                                    .cloned()
+                                    .unwrap_or_else(|| name.clone());
+                                record_salvaged_leak(&client_name);
                                 events.extend(self.synthesize_tool_use(name, input_json));
                             } else {
                                 // 不捞回（嵌句中 / 围栏内 / 工具名未知 / 解析失败）→ 整段当普通文本吐出
