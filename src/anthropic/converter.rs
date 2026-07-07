@@ -645,6 +645,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .collect();
     remove_non_adjacent_tool_uses(&mut history, &current_result_ids);
 
+    // 9c. Bug A 最终兜底：上面的 tool_result 清理（remove_orphaned / remove_non_adjacent）会把
+    // 「原本带 tool_result、但对应 tool_use 已被移除」的 user 消息清成纯空壳（content="" 且
+    // 无 tool_result）。这类空壳产生于 merge_user_messages 兜底之后，故必须在所有清理完成后
+    // 再扫一遍，把 content 空 + 无图片 + 无 tool_result 的历史 user 兜底为 "."，否则上游
+    // 报 "Improperly formed request"（154 结构抓包实证：空壳 user 前条 assistant tool_uses=0，
+    // 即其 tool_result 因无邻接 tool_use 被 Pass 2 清除）。
+    backfill_empty_user_content(&mut history);
+
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
@@ -971,6 +979,25 @@ fn validate_tool_pairing(
     }
 
     (filtered_results, unpaired_tool_use_ids)
+}
+
+/// Bug A 最终兜底：把历史里纯空壳 user 消息（content 空 + 无图片 + 无 tool_result）
+/// 的 content 填为 "."。必须在所有 tool_result 清理之后调用（清理会新产生空壳）。
+///
+/// Kiro 上游要求 `userInputMessage.content` 非空，空壳 → "Improperly formed request"
+/// (REQUEST_BODY_INVALID)。对齐 Kiro-Go 的 minimalFallbackUserContent="."。
+fn backfill_empty_user_content(history: &mut [Message]) {
+    for msg in history.iter_mut() {
+        if let Message::User(user_msg) = msg {
+            let uim = &mut user_msg.user_input_message;
+            let empty_content = uim.content.trim().is_empty();
+            let no_images = uim.images.is_empty();
+            let no_tool_results = uim.user_input_message_context.tool_results.is_empty();
+            if empty_content && no_images && no_tool_results {
+                uim.content = ".".to_string();
+            }
+        }
+    }
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -1904,6 +1931,38 @@ mod tests {
             Some("xhigh"),
             "unknown future models should keep recognized effort values"
         );
+    }
+
+    #[test]
+    fn test_orphaned_tool_result_cleaned_to_empty_shell_gets_dot() {
+        // Bug A 真实成因(154 抓包实证)：user 带 tool_result，但前条 assistant 无对应 tool_use，
+        // → remove_non_adjacent_tool_uses Pass 2 清除孤立 tool_result → user 变纯空壳。
+        // 此空壳产生于 merge_user_messages 兜底之后，必须由 9c backfill 兜底为 "."。
+        let req_json = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "messages": [
+                {"role":"user","content":"real"},
+                {"role":"assistant","content":"no tool use here"},      // 无 tool_use
+                {"role":"user","content":[                                // 带孤立 tool_result
+                    {"type":"tool_result","tool_use_id":"orphan_x","content":"r"}
+                ]},
+                {"role":"assistant","content":"resp"},
+                {"role":"user","content":"current"}
+            ]
+        });
+        let req: super::super::types::MessagesRequest = serde_json::from_value(req_json).unwrap();
+        let result = convert_request(&req).unwrap();
+        let cs = serde_json::to_value(&result.conversation_state).unwrap();
+        for (i, m) in cs["history"].as_array().unwrap().iter().enumerate() {
+            if let Some(uim) = m.get("userInputMessage") {
+                let c = uim["content"].as_str().unwrap_or("");
+                assert!(
+                    !c.is_empty(),
+                    "history USER idx {i} 被清成空壳后必须兜底为非空，实际为空"
+                );
+            }
+        }
     }
 
     #[test]
