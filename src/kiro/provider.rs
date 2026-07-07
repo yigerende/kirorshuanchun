@@ -42,6 +42,162 @@ pub(crate) fn truncate_for_log(body: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}…[截断,完整 {} bytes]", &body[..end], body.len()))
 }
 
+/// 结构化诊断抓包：已写出的样本数（进程级上限，避免刷爆磁盘/日志）。
+static BODY_SHAPE_CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 诊断用：当上游返回 400 REQUEST_BODY_INVALID 时，对已转换的 conversationState
+/// 只导出**结构形状**（角色、块类型、tool_use/tool_result 配对、thinking 是否存在、
+/// 各字段长度），**不含任何 prompt 文本**（文本一律以长度/哈希占位）。
+///
+/// 仅当环境变量 `KIRO_CAPTURE_BODY_SHAPE=<dir>` 设置时启用，且进程内最多写 `KIRO_CAPTURE_BODY_SHAPE_MAX`
+/// （默认 8）个样本。用于定位 opus-4-8/sonnet-5 专属的 "Improperly formed request"。
+fn capture_body_shape_on_400(request_body: &str, model: Option<&str>, error_body: &str) {
+    let dir = match std::env::var("KIRO_CAPTURE_BODY_SHAPE") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    // 仅抓 REQUEST_BODY_INVALID（"Improperly formed" / "Invalid tool use"）。
+    if !error_body.contains("REQUEST_BODY_INVALID") {
+        return;
+    }
+    let max = std::env::var("KIRO_CAPTURE_BODY_SHAPE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    let n = BODY_SHAPE_CAPTURES.fetch_add(1, Ordering::Relaxed);
+    if n >= max {
+        return;
+    }
+
+    let shape = build_body_shape(request_body, model, error_body);
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
+    let path = format!("{}/shape-{}-{}.json", dir.trim_end_matches('/'), ts, n);
+    if let Ok(pretty) = serde_json::to_string_pretty(&shape) {
+        let _ = std::fs::write(&path, pretty);
+        tracing::warn!("已写出请求体结构诊断样本 #{}: {}", n, path);
+    }
+}
+
+/// 从转换后的 conversationState JSON 中抽取「形状」，文本内容全部脱敏为长度。
+fn build_body_shape(
+    request_body: &str,
+    model: Option<&str>,
+    error_body: &str,
+) -> serde_json::Value {
+    use serde_json::json;
+    let root: serde_json::Value = match serde_json::from_str(request_body) {
+        Ok(v) => v,
+        Err(e) => return json!({"parse_error": e.to_string(), "raw_len": request_body.len()}),
+    };
+    let cs = root.get("conversationState").unwrap_or(&serde_json::Value::Null);
+
+    // 单条 userInputMessage / assistantResponseMessage 的形状。
+    let shape_user = |uim: &serde_json::Value| -> serde_json::Value {
+        let content = uim.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let ctx = uim.get("userInputMessageContext");
+        let tool_results: Vec<serde_json::Value> = ctx
+            .and_then(|c| c.get("toolResults"))
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| {
+                        json!({
+                            "toolUseId": r.get("toolUseId").and_then(|v| v.as_str()).map(|s| s.len()),
+                            "status": r.get("status").and_then(|v| v.as_str()),
+                            "content_blocks": r.get("content").and_then(|v| v.as_array()).map(|a| a.len()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tools_n = ctx
+            .and_then(|c| c.get("tools"))
+            .and_then(|t| t.as_array())
+            .map(|a| a.len());
+        json!({
+            "kind": "user",
+            "content_len": content.len(),
+            "content_has_thinking_tag": content.contains("<thinking"),
+            "content_empty": content.is_empty(),
+            "images": uim.get("images").and_then(|i| i.as_array()).map(|a| a.len()),
+            "tool_results": tool_results,
+            "tools_count": tools_n,
+            "modelId": uim.get("modelId").and_then(|v| v.as_str()),
+            "origin": uim.get("origin").and_then(|v| v.as_str()),
+        })
+    };
+    let shape_assistant = |arm: &serde_json::Value| -> serde_json::Value {
+        let content = arm.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let tool_uses: Vec<serde_json::Value> = arm
+            .get("toolUses")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|tu| {
+                        let input = tu.get("input");
+                        json!({
+                            "toolUseId_len": tu.get("toolUseId").and_then(|v| v.as_str()).map(|s| s.len()),
+                            "name": tu.get("name").and_then(|v| v.as_str()),
+                            "input_is_object": input.map(|v| v.is_object()),
+                            "input_type": input.map(|v| match v {
+                                serde_json::Value::Object(_) => "object",
+                                serde_json::Value::Array(_) => "array",
+                                serde_json::Value::String(_) => "string",
+                                serde_json::Value::Number(_) => "number",
+                                serde_json::Value::Bool(_) => "bool",
+                                serde_json::Value::Null => "null",
+                            }),
+                            "input_keys": input.and_then(|v| v.as_object()).map(|o| o.len()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({
+            "kind": "assistant",
+            "content_len": content.len(),
+            "content_empty": content.is_empty(),
+            "content_is_single_space": content == " ",
+            "content_has_thinking_tag": content.contains("<thinking"),
+            "tool_uses": tool_uses,
+        })
+    };
+
+    let history_shape: Vec<serde_json::Value> = cs
+        .get("history")
+        .and_then(|h| h.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    if let Some(uim) = m.get("userInputMessage") {
+                        shape_user(uim)
+                    } else if let Some(arm) = m.get("assistantResponseMessage") {
+                        shape_assistant(arm)
+                    } else {
+                        json!({"kind": "unknown", "keys": m.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())})
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let current = cs
+        .get("currentMessage")
+        .and_then(|c| c.get("userInputMessage"))
+        .map(shape_user);
+
+    json!({
+        "model": model,
+        "error_body": error_body,
+        "request_body_len": request_body.len(),
+        "chatTriggerType": cs.get("chatTriggerType").and_then(|v| v.as_str()),
+        "agentTaskType": cs.get("agentTaskType").and_then(|v| v.as_str()),
+        "history_len": history_shape.len(),
+        "history": history_shape,
+        "current_message": current,
+    })
+}
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -923,6 +1079,9 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // 诊断：REQUEST_BODY_INVALID 时导出转换后 conversationState 的结构形状
+                // （脱敏，无 prompt 文本），用于定位 opus-4-8/sonnet-5 专属 "Improperly formed"。
+                capture_body_shape_on_400(request_body, model.as_deref(), &body);
                 Self::emit_attempt(
                     sink,
                     Self::next_trace_step(&mut trace_step),
