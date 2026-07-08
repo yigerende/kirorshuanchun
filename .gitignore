@@ -3,6 +3,9 @@
 /AGENTS.md
 /config.json
 /credentials.json
+# 批量导入/导出的凭据快照（含明文 access/refresh token，文件名用连字符，
+# /credentials.* 挡不住，必须单列，绝对不能提交）
+/credentials-*.json
 /.idea
 /test.json
 /admin-ui/node_modules/
