@@ -1584,4 +1584,97 @@ mod tests {
         assert_eq!(routing.preferred().as_deref(), Some("runtime"));
         assert!(!routing.fallback());
     }
+
+    // ---- 核心重试/故障转移决策纯函数（此前零覆盖，是整个代理执行路径的关键判据）----
+
+    #[test]
+    fn fallbackable_status_excludes_account_level_codes() {
+        use reqwest::StatusCode;
+        // 账号级状态（401/402/403）不应触发同账号换端点——由账号级分支处理。
+        assert!(!KiroProvider::is_fallbackable_status(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!KiroProvider::is_fallbackable_status(StatusCode::PAYMENT_REQUIRED)); // 402
+        assert!(!KiroProvider::is_fallbackable_status(StatusCode::FORBIDDEN)); // 403
+        // 其余非 200 一律 fallback：含 400 校验错、429 限流、5xx、524 网关超时。
+        assert!(KiroProvider::is_fallbackable_status(StatusCode::BAD_REQUEST)); // 400
+        assert!(KiroProvider::is_fallbackable_status(StatusCode::TOO_MANY_REQUESTS)); // 429
+        assert!(KiroProvider::is_fallbackable_status(StatusCode::INTERNAL_SERVER_ERROR)); // 500
+        assert!(KiroProvider::is_fallbackable_status(
+            StatusCode::from_u16(524).unwrap()
+        ));
+        // 网络错误恒可 fallback。
+        assert!(KiroProvider::is_fallbackable_network_error());
+    }
+
+    #[test]
+    fn endpoint_alias_maps_kiro_to_ide_only() {
+        // "kiro" 是 "ide" 的别名，其余名字原样返回。
+        assert_eq!(KiroProvider::endpoint_alias("kiro"), "ide");
+        assert_eq!(KiroProvider::endpoint_alias("ide"), "ide");
+        assert_eq!(KiroProvider::endpoint_alias("codewhisperer"), "codewhisperer");
+        assert_eq!(KiroProvider::endpoint_alias("runtime"), "runtime");
+    }
+
+    #[test]
+    fn auto_endpoint_detection() {
+        assert!(KiroProvider::is_auto_endpoint("auto"));
+        assert!(!KiroProvider::is_auto_endpoint("ide"));
+        assert!(!KiroProvider::is_auto_endpoint("kiro"));
+        assert!(!KiroProvider::is_auto_endpoint(""));
+    }
+
+    #[test]
+    fn retry_delay_is_bounded_and_monotone_in_expectation() {
+        // 通用退避封顶 2s（含 ≤25% 抖动，故上界 2500ms）；到达封顶后不再增长。
+        for attempt in 0..10usize {
+            let d = KiroProvider::retry_delay(attempt).as_millis() as u64;
+            assert!(d <= 2_500, "attempt={attempt} delay={d} 超过 2s+jitter 上界");
+            assert!(d >= 200, "attempt={attempt} delay={d} 低于 base");
+        }
+        // 大 attempt 收敛到封顶区间，不溢出（saturating_pow 保护）。
+        let big = KiroProvider::retry_delay(usize::MAX).as_millis() as u64;
+        assert!((2_000..=2_500).contains(&big), "大 attempt 应收敛到封顶：{big}");
+    }
+
+    #[test]
+    fn throttle_delay_is_longer_than_generic() {
+        // 429 专用退避 base 1s、封顶 8s，明显长于通用退避，给账号配额恢复窗口。
+        for attempt in 0..10usize {
+            let d = KiroProvider::retry_delay_throttle(attempt).as_millis() as u64;
+            assert!(d >= 1_000, "attempt={attempt} throttle delay={d} 低于 1s base");
+            assert!(d <= 10_000, "attempt={attempt} throttle delay={d} 超过 8s+jitter 上界");
+        }
+        let big = KiroProvider::retry_delay_throttle(usize::MAX).as_millis() as u64;
+        assert!((8_000..=10_000).contains(&big), "大 attempt 应收敛到 8s 封顶：{big}");
+    }
+
+    #[test]
+    fn extract_model_from_request_reads_nested_model_id() {
+        let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-opus-4-8","content":"hi"}}}}"#;
+        assert_eq!(
+            KiroProvider::extract_model_from_request(body).as_deref(),
+            Some("claude-opus-4-8")
+        );
+        // 缺字段/非法 JSON 一律返回 None，绝不 panic。
+        assert_eq!(KiroProvider::extract_model_from_request("{}"), None);
+        assert_eq!(KiroProvider::extract_model_from_request("not json"), None);
+        assert_eq!(
+            KiroProvider::extract_model_from_request(
+                r#"{"conversationState":{"currentMessage":{}}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn next_trace_step_increments_and_saturates() {
+        let mut step = 0usize;
+        assert_eq!(KiroProvider::next_trace_step(&mut step), 0);
+        assert_eq!(KiroProvider::next_trace_step(&mut step), 1);
+        assert_eq!(KiroProvider::next_trace_step(&mut step), 2);
+        assert_eq!(step, 3);
+        // saturating：接近上界不 panic。
+        let mut max = usize::MAX;
+        assert_eq!(KiroProvider::next_trace_step(&mut max), usize::MAX);
+        assert_eq!(max, usize::MAX);
+    }
 }
