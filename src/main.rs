@@ -443,12 +443,14 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!(
-                    "  apiKey      = {}（首次启动时将自动导入为第一条客户端 Key）",
-                    api_key
-                );
-                tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
-                tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
+                // 密钥仅在此首次启动时刻直出 stdout（不经 tracing）。原因：INFO 级日志常被
+                // docker logs / journald / 日志转发中间件收集归档，明文密钥会长期落盘。
+                // 这里用 println! 做一次性展示，操作者据此保存后即可；密钥本身已写入配置文件。
+                println!("\n================ 首次启动·一次性密钥展示（请立即保存，勿再从日志查阅）================");
+                println!("  apiKey      = {api_key}（首次启动时将自动导入为第一条客户端 Key）");
+                println!("  adminApiKey = {admin_api_key}（管理面板登录密钥）");
+                println!("  上述密钥可在配置文件 {} 中查看/修改", config_p.display());
+                println!("=====================================================================================\n");
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),
         }
