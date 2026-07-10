@@ -24,11 +24,9 @@ impl RuntimeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        if ctx.credentials.is_external_idp() {
-            ctx.credentials.data_plane_region()
-        } else {
-            ctx.credentials.effective_api_region(ctx.config)
-        }
+        // 任何凭据类型只要 profileArn 解析出区域就以它为准（对齐 Kiro-Go
+        // kiroRegionForProfile），否则回落凭据/ config 区域。
+        ctx.credentials.effective_data_plane_region(ctx.config)
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {

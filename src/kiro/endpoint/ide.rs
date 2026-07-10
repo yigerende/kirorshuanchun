@@ -24,13 +24,10 @@ impl IdeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        // external_idp：数据面区域以已解析的 profileArn 为准（可能是 eu-central-1 等），
-        // 不能用 config 区域；其余凭据沿用 config 的 effective_api_region。
-        if ctx.credentials.is_external_idp() {
-            ctx.credentials.data_plane_region()
-        } else {
-            ctx.credentials.effective_api_region(ctx.config)
-        }
+        // 数据面区域：任何凭据类型只要 profileArn 解析出区域就以它为准（IAM / IdC 的
+        // profile 也可能落在 eu-central-1），否则回落凭据/ config 区域（对齐 Kiro-Go
+        // kiroRegionForProfile）。主机族仍由 host() 依 is_external_idp 决定。
+        ctx.credentials.effective_data_plane_region(ctx.config)
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
@@ -269,5 +266,30 @@ mod tests {
         );
         assert_eq!(ep.host(&ctx), "q.us-east-1.amazonaws.com");
         assert_eq!(ep.mcp_url(&ctx), "https://q.us-east-1.amazonaws.com/mcp");
+    }
+
+    #[test]
+    fn test_iam_idc_eu_central_1_routes_by_profile_arn() {
+        // 回归防护：IAM 账号（归一为 idc，is_external_idp=false）+ eu-central-1 profileArn
+        // 必须路由到 q.eu-central-1，而非被 config 默认区域拖回 us-east-1。
+        // 修复前：走 effective_api_region → us-east-1，主机/profileArn 区域不匹配 → 400。
+        let ep = IdeEndpoint::new();
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("iam".to_string());
+        cred.canonicalize_auth_method();
+        cred.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        assert!(!cred.is_external_idp());
+        let config = Config::default(); // region 默认 us-east-1，必须被 profileArn 覆盖
+        let ctx = RequestContext {
+            credentials: &cred,
+            token: "t",
+            machine_id: "m",
+            config: &config,
+        };
+        assert_eq!(
+            ep.api_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(ep.host(&ctx), "q.eu-central-1.amazonaws.com");
     }
 }

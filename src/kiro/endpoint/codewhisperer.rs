@@ -37,14 +37,11 @@ impl CodewhispererEndpoint {
         Self
     }
 
-    /// 数据面区域：`external_idp` 以已解析的 profileArn 区域为准，其余凭据沿用 config 区域。
-    /// 与 `ide` 端点逻辑一致；差异仅在 [`Self::host`] 把该区域交给 `external_idp_host`。
+    /// 数据面区域：任何凭据类型只要 profileArn 解析出区域就以它为准（对齐 Kiro-Go
+    /// kiroRegionForProfile），否则回落凭据/ config 区域。差异仅在 [`Self::host`]
+    /// 把该区域交给 `external_idp_host`。
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        if ctx.credentials.is_external_idp() {
-            ctx.credentials.data_plane_region()
-        } else {
-            ctx.credentials.effective_api_region(ctx.config)
-        }
+        ctx.credentials.effective_data_plane_region(ctx.config)
     }
 
     /// 与 `ide` 的关键差异：对所有凭据类型一致走 `external_idp_host`，

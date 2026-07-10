@@ -476,6 +476,26 @@ impl KiroCredentials {
             .or(self.region.as_deref())
             .unwrap_or("us-east-1")
     }
+
+    /// 统一数据面区域（对齐 Kiro-Go `kiroRegionForProfile`）：**任何凭据类型**，
+    /// 只要已解析出 profileArn 的区域段就以它为准（IAM / IdC / Social / external_idp
+    /// 的 profile 都可能落在 `eu-central-1` 等非 us-east-1 区域），其次是凭据显式
+    /// `api_region` / `region`，最后回落 config 的 `effective_api_region`。
+    ///
+    /// 修复点：此前流式端点仅对 `external_idp` 走 profileArn 区域，IAM / IdC 账号的
+    /// eu-central-1 profile 被错误地路由到 config 区域（默认 `us-east-1`）——主机算成
+    /// `q.us-east-1` 却带 eu-central-1 的 profileArn → 区域/profile 不匹配 → 上游
+    /// `400 Improperly formed request` → 调度层判失败 → 表现为「无法调度使用」。
+    ///
+    /// 对既有 us-east-1 账号零影响（profileArn 区域即 us-east-1，或回落 config 默认）。
+    pub fn effective_data_plane_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        self.profile_arn
+            .as_deref()
+            .and_then(region_from_profile_arn)
+            .or(self.api_region.as_deref())
+            .or(self.region.as_deref())
+            .unwrap_or(config.effective_api_region())
+    }
 }
 
 /// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
@@ -931,6 +951,43 @@ mod tests {
         let mut placeholder = KiroCredentials::default();
         placeholder.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
         assert_eq!(placeholder.data_plane_region(), "us-east-1");
+    }
+
+    #[test]
+    fn test_effective_data_plane_region_all_auth_types() {
+        let config = Config::default(); // region 默认 us-east-1
+
+        // IAM（归一为 idc）+ eu-central-1 profileArn → 取 profileArn 区域（核心修复）
+        let mut iam = KiroCredentials::default();
+        iam.auth_method = Some("iam".to_string());
+        iam.canonicalize_auth_method();
+        iam.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        assert!(!iam.is_external_idp());
+        assert_eq!(iam.effective_data_plane_region(&config), "eu-central-1");
+
+        // 无 profileArn 的普通凭据 → 回落 config 区域（保持既有行为）
+        let plain = KiroCredentials::default();
+        assert_eq!(plain.effective_data_plane_region(&config), "us-east-1");
+
+        // 凭据显式 api_region 优先于 config，但低于 profileArn
+        let mut api_only = KiroCredentials::default();
+        api_only.api_region = Some("ap-southeast-1".to_string());
+        assert_eq!(
+            api_only.effective_data_plane_region(&config),
+            "ap-southeast-1"
+        );
+
+        // profileArn 区域优先于凭据 api_region
+        let mut both = KiroCredentials::default();
+        both.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        both.api_region = Some("us-east-1".to_string());
+        assert_eq!(both.effective_data_plane_region(&config), "eu-central-1");
+
+        // external_idp 仍取 profileArn 区域（行为不变）
+        let mut ext = KiroCredentials::default();
+        ext.auth_method = Some("external_idp".to_string());
+        ext.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        assert_eq!(ext.effective_data_plane_region(&config), "eu-central-1");
     }
 
     #[test]
