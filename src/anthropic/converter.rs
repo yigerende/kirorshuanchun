@@ -646,6 +646,41 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .collect();
     remove_non_adjacent_tool_uses(&mut history, &current_result_ids);
 
+    // 9b'. 当前消息(currentMessage)的 tool_result 也必须与末条历史 assistant 的 tool_use
+    // 邻接——否则上游报 `messages.{last}.content.0: unexpected tool_use_id`
+    // （TOOL_USE_RESULT_MISMATCH 400，216 traces 实证 181 次）。此前只有 history 侧被
+    // remove_non_adjacent 双向修剪，当前消息的 tool_results 仅经 validate_tool_pairing 的
+    // “存在性”校验：若某 tool_result 的 tool_use 在**非末条** assistant 轮，Pass 1 会把那条
+    // 非邻接 tool_use 删除，当前 tool_result 遂成孤儿却无人复查。这里以“Pass 1 修剪后末条
+    // assistant 存活的 tool_use 集合”为准，丢弃当前消息里无邻接 tool_use 的 tool_result。
+    let last_assistant_use_ids: std::collections::HashSet<String> = history
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Assistant(a) => Some(
+                a.assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map(|tus| tus.iter().map(|t| t.tool_use_id.clone()).collect())
+                    .unwrap_or_default(),
+            ),
+            Message::User(_) => None,
+        })
+        .unwrap_or_default();
+    let validated_tool_results: Vec<ToolResult> = validated_tool_results
+        .into_iter()
+        .filter(|r| {
+            let keep = last_assistant_use_ids.contains(&r.tool_use_id);
+            if !keep {
+                tracing::warn!(
+                    "丢弃当前消息中非邻接的 tool_result（末条 assistant 轮无对应 tool_use，避免上游 TOOL_USE_RESULT_MISMATCH 400），tool_use_id={}",
+                    r.tool_use_id
+                );
+            }
+            keep
+        })
+        .collect();
+
     // 9c. Bug A 最终兜底：上面的 tool_result 清理（remove_orphaned / remove_non_adjacent）会把
     // 「原本带 tool_result、但对应 tool_use 已被移除」的 user 消息清成纯空壳（content="" 且
     // 无 tool_result）。这类空壳产生于 merge_user_messages 兜底之后，故必须在所有清理完成后
@@ -3265,6 +3300,96 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_current_tool_result_non_adjacent_to_last_assistant_is_dropped() {
+        // 复现生产 TOOL_USE_RESULT_MISMATCH 400（216 traces 实证，181 次）：
+        // 当前消息(末轮 user)携带 tool_result call_X，但 call_X 的 tool_use 位于
+        // **非末条** 历史 assistant 轮（中间夹了纯文本 assistant 轮）。
+        // validate_tool_pairing 仅做“存在性”校验 → 接受 call_X；
+        // remove_non_adjacent Pass 1 又把那条非邻接 tool_use 删掉 →
+        // 当前 tool_result 变孤儿，却无任何 pass 复查当前消息 →
+        // 上游 messages.{last}.content.0: unexpected tool_use_id → 400。
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run the tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "calling"},
+                        {"type": "tool_use", "id": "call_X", "name": "do_it", "input": {}}
+                    ]),
+                },
+                // 夹一条**纯文本 user**（非 tool_result）→ 阻止 assistant 合并，且
+                // 令 call_X 在历史中始终“未被回答”。
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hmm, wait"),
+                },
+                // 末条历史 assistant：纯文本、无 tool_use。
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": "sure"}]),
+                },
+                // 末轮 user 才携带 call_X 的 tool_result（相对末条 assistant 非邻接，
+                // 且其 tool_use 会被 Pass 1 当作非邻接从历史删掉）。
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_X", "content": "done"}
+                    ]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req).unwrap().conversation_state;
+
+        // 收集末条历史 assistant 的存活 tool_use id。
+        let last_assistant_use_ids: std::collections::HashSet<String> = state
+            .history
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant(a) => Some(
+                    a.assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|tus| tus.iter().map(|t| t.tool_use_id.clone()).collect())
+                        .unwrap_or_default(),
+                ),
+                Message::User(_) => None,
+            })
+            .unwrap_or_default();
+
+        // 不变式：当前消息里的每个 tool_result 必须能在末条 assistant 轮找到 tool_use，
+        // 否则上游必报 TOOL_USE_RESULT_MISMATCH。
+        for r in &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            assert!(
+                last_assistant_use_ids.contains(&r.tool_use_id),
+                "当前 tool_result {} 在末条 assistant 轮无对应 tool_use（会触发上游 400）",
+                r.tool_use_id
+            );
+        }
     }
 
     // base64 of a 1x1 PNG (valid PNG header, so resize just passes it through)
