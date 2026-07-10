@@ -62,8 +62,13 @@ fn capture_body_shape_on_400(request_body: &str, model: Option<&str>, error_body
         Ok(d) if !d.is_empty() => d,
         _ => return,
     };
-    // 仅抓 REQUEST_BODY_INVALID（"Improperly formed" / "Invalid tool use"）。
-    if !error_body.contains("REQUEST_BODY_INVALID") {
+    // 抓两类可诊断的结构性 400：
+    // - REQUEST_BODY_INVALID（"Improperly formed" / "Invalid tool use"）
+    // - TOOL_USE_RESULT_MISMATCH（tool_use/tool_result 配对/邻接断裂，如
+    //   "unexpected tool_use_id" / "toolResult blocks exceeds toolUse blocks"）
+    if !error_body.contains("REQUEST_BODY_INVALID")
+        && !error_body.contains("TOOL_USE_RESULT_MISMATCH")
+    {
         return;
     }
     let max = std::env::var("KIRO_CAPTURE_BODY_SHAPE_MAX")
@@ -97,6 +102,20 @@ fn build_body_shape(
     };
     let cs = root.get("conversationState").unwrap_or(&serde_json::Value::Null);
 
+    // tool_use_id 的稳定短哈希：id 是不透明句柄（如 call_xxx / toolu_xxx），非 prompt 文本，
+    // 但要诊断配对/邻接必须能跨轮次对齐同一 id。故仅导出 6 位十六进制哈希（FNV-1a），
+    // 既不泄露原文、又能在样本内判断「某 tool_result 的 id 是否等于某轮 tool_use 的 id」。
+    let id_hash = |id: Option<&str>| -> Option<String> {
+        id.map(|s| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in s.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            format!("{:06x}", (h & 0xffffff))
+        })
+    };
+
     // 单条 userInputMessage / assistantResponseMessage 的形状。
     let shape_user = |uim: &serde_json::Value| -> serde_json::Value {
         let content = uim.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -108,7 +127,8 @@ fn build_body_shape(
                 arr.iter()
                     .map(|r| {
                         json!({
-                            "toolUseId": r.get("toolUseId").and_then(|v| v.as_str()).map(|s| s.len()),
+                            "toolUseId_len": r.get("toolUseId").and_then(|v| v.as_str()).map(|s| s.len()),
+                            "toolUseId_hash": id_hash(r.get("toolUseId").and_then(|v| v.as_str())),
                             "status": r.get("status").and_then(|v| v.as_str()),
                             "content_blocks": r.get("content").and_then(|v| v.as_array()).map(|a| a.len()),
                         })
@@ -158,6 +178,7 @@ fn build_body_shape(
                         let input = tu.get("input");
                         json!({
                             "toolUseId_len": tu.get("toolUseId").and_then(|v| v.as_str()).map(|s| s.len()),
+                            "toolUseId_hash": id_hash(tu.get("toolUseId").and_then(|v| v.as_str())),
                             "name": tu.get("name").and_then(|v| v.as_str()),
                             "input_is_object": input.map(|v| v.is_object()),
                             "input_type": input.map(|v| match v {
@@ -1556,6 +1577,50 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_body_shape_tool_id_hash_correlates_across_turns() {
+        // 抓包形状必须能跨轮次对齐同一 tool_use_id（用短哈希），否则无法诊断
+        // TOOL_USE_RESULT_MISMATCH（哪个 tool_result 的 id 找不到对应 tool_use）。
+        let body = serde_json::json!({
+            "conversationState": {
+                "history": [
+                    {"assistantResponseMessage": {
+                        "content": "",
+                        "toolUses": [{"toolUseId": "call_ABC", "name": "do_it", "input": {}}]
+                    }},
+                    {"userInputMessage": {
+                        "content": "",
+                        "userInputMessageContext": {
+                            "toolResults": [{"toolUseId": "call_ABC", "status": "success", "content": []}]
+                        }
+                    }}
+                ],
+                "currentMessage": {"userInputMessage": {
+                    "content": "",
+                    "userInputMessageContext": {
+                        "toolResults": [{"toolUseId": "call_ORPHAN", "status": "success", "content": []}]
+                    }
+                }}
+            }
+        })
+        .to_string();
+
+        let shape = build_body_shape(&body, Some("claude-opus-4-8"), "TOOL_USE_RESULT_MISMATCH");
+        let hist = shape["history"].as_array().unwrap();
+        let use_hash = hist[0]["tool_uses"][0]["toolUseId_hash"].as_str().unwrap();
+        let res_hash = hist[1]["tool_results"][0]["toolUseId_hash"].as_str().unwrap();
+        // 同一 id（call_ABC）→ 历史里 tool_use 与 tool_result 哈希一致（可判定为已配对）。
+        assert_eq!(use_hash, res_hash, "同一 tool_use_id 的哈希应一致，才能判定配对");
+
+        // 当前消息的孤儿 tool_result（call_ORPHAN）哈希与任何历史 tool_use 都不同。
+        let cur_hash = shape["current_message"]["tool_results"][0]["toolUseId_hash"]
+            .as_str()
+            .unwrap();
+        assert_ne!(cur_hash, use_hash, "孤儿 tool_result 的哈希应与历史 tool_use 不同");
+        // 哈希为 6 位十六进制、且不泄露原文长度以外的信息。
+        assert_eq!(cur_hash.len(), 6);
+    }
 
     #[test]
     fn test_endpoint_routing_initial_values() {
