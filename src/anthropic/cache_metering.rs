@@ -393,12 +393,18 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 ///   1. metadata.user_id 里的 session 段（Claude Code 格式含 `_session_<uuid>`）；
 ///   2. 退回客户端 Key id。
 ///
-/// 注：无 session 的客户端（OpenAI 端点 `metadata:None`、裸客户端）退回 `key:{key_id}`，
-/// 同一 key 下多对话会共享一条 `MeterGovernance::observe_session` 记录。这**不会**再导致
-/// creation 爆炸——[`MeterGovernance::observe_session`] 用**消息条数高水位**，任何短请求
-/// 都不会把 delta 下界 `prev_n` 打小，共享 seed 下最长对话的高水位反而让其余对话 creation
-/// 偏低（命中率偏高，经济上安全）。曾尝试用对话指纹拆分 seed 做 per-conversation 隔离，
-/// 但实测把 fallback 流量拆成大量首见即 cold 的 seed → 命中率反降、creation 爆炸，已回退。
+/// 注：无 session 的客户端（OpenAI 端点 `metadata:None`、裸客户端）退回
+/// `key:{key_id}:root:{hash(messages[0])}` —— **key 级 + 对话根哈希**。
+///
+/// 为什么加对话根哈希：单靠 `key:{key_id}` 会让同一 key 下**所有不同对话**共享一条
+/// [`MeterGovernance::observe_session`] 记录。该记录存**消息条数高水位**，一旦某个长对话
+/// 把水位顶高，同 key 上其余**更短对话**的 `prev_n` 就被顶到 `>= n-1` → creation 区间塌成空
+/// → creation 恒为 0（216 实测 98.3% 请求 creation=0、read 占比 99.5% 的根因）。以对话根
+/// （首条消息，整段对话生命周期内不变）哈希入 seed，使不同对话天然分到不同记录、各自独立
+/// 高水位；同一对话的后续轮次 messages[0] 不变 → seed 不变 → 仍 warm（不会退化成每轮 cold）。
+///
+/// 与旧「全量对话指纹」方案的关键区别：旧方案把**整段消息**入哈希，每轮追加消息都变新 seed
+/// → 永远首见即 cold → 命中率反降、creation 爆炸。这里**只哈希首条**，天然轮次稳定。
 ///
 /// `pub(crate)`：响应缓存复用同一套会话隔离口径构造缓存键，保证两者隔离边界一致。
 pub(crate) fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
@@ -410,7 +416,31 @@ pub(crate) fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
     {
         return format!("sess:{session}");
     }
-    format!("key:{key_id}")
+    // 无显式 session：key 级 + 对话根哈希，隔离同 key 下的不同对话。
+    match req.messages.first() {
+        Some(root) => format!("key:{key_id}:root:{:016x}", conversation_root_hash(root)),
+        None => format!("key:{key_id}"),
+    }
+}
+
+/// 对话根（首条消息）的稳定哈希（FNV-1a over role + 规范化文本）。
+/// 只取首条：整段对话生命周期内不变 → 同一对话多轮同 seed；不同对话大概率不同 seed。
+fn conversation_root_hash(root: &super::types::Message) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(root.role.as_bytes());
+    mix(b"\x00");
+    // content 可能是字符串或块数组；序列化为紧凑 JSON 后哈希（确定性、与结构无关的稳定串）。
+    match serde_json::to_string(&root.content) {
+        Ok(s) => mix(s.as_bytes()),
+        Err(_) => mix(b"?"),
+    }
+    h
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
@@ -960,12 +990,19 @@ mod tests {
 
     #[test]
     fn isolation_seed_prefers_session_then_key() {
-        let mut req = req_with(vec![msg("user", "x")], None);
-        assert_eq!(isolation_seed(&req, 7), "key:7");
-        req.metadata = Some(Metadata {
+        let req = req_with(vec![msg("user", "x")], None);
+        // 无 session：回退 key 级 + 对话根哈希（不再是裸 key:7），前缀仍以 key:7 打头。
+        let fallback = isolation_seed(&req, 7);
+        assert!(
+            fallback.starts_with("key:7:root:"),
+            "无 session 回退应为 key:7:root:<hash>，实得 {fallback}"
+        );
+        // 显式 session 最高优先。
+        let mut req2 = req;
+        req2.metadata = Some(Metadata {
             user_id: Some("user_abc_account__session_uuid-123".to_string()),
         });
-        assert_eq!(isolation_seed(&req, 7), "sess:uuid-123");
+        assert_eq!(isolation_seed(&req2, 7), "sess:uuid-123");
     }
 
     #[test]
@@ -992,5 +1029,113 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .unwrap();
         B64.encode(&buf)
+    }
+
+    // ---- isolation_seed 根哈希隔离（修复目标）---------------------------------
+
+    /// 无显式 session id 时，同一 key 下的**不同对话**必须拿到**不同 seed**（按对话根
+    /// messages[0] 区分），否则它们共用一条 last_seen 记录 → 高水位互相污染 → creation 塌陷。
+    /// 见 [`creation_collapses_when_conversations_share_key_seed`]。
+    #[test]
+    fn isolation_seed_distinguishes_conversations_under_same_key() {
+        // 两个不同对话（首条 user 不同），无 metadata → 回退 key 级 seed。
+        let conv_a = req_with(vec![msg("user", "help me refactor the auth module")], None);
+        let conv_b = req_with(vec![msg("user", "write a poem about the sea")], None);
+
+        let seed_a = isolation_seed(&conv_a, 0);
+        let seed_b = isolation_seed(&conv_b, 0);
+        assert_ne!(
+            seed_a, seed_b,
+            "同 key 下不同对话应得到不同 seed（当前实现都返回 key:0 → 会红）"
+        );
+    }
+
+    /// 同一对话的多轮请求（messages[0] 不变、后续追加）必须拿到**相同 seed**，
+    /// 否则每轮都变新 seed → 永远 cold → creation 爆炸（正是上次全量指纹方案翻车点）。
+    #[test]
+    fn isolation_seed_stable_across_turns_of_same_conversation() {
+        let root = "help me refactor the auth module";
+        let turn1 = req_with(vec![msg("user", root)], None);
+        let turn2 = req_with(
+            vec![
+                msg("user", root),
+                msg("assistant", "sure, let's start"),
+                msg("user", "now add tests"),
+            ],
+            None,
+        );
+        assert_eq!(
+            isolation_seed(&turn1, 0),
+            isolation_seed(&turn2, 0),
+            "同一对话多轮（messages[0] 不变）必须同 seed，否则永远 cold"
+        );
+    }
+
+    /// 显式 session id 仍最高优先（根哈希只是无 session 时的回退隔离）。
+    #[test]
+    fn isolation_seed_explicit_session_takes_priority() {
+        let mut req = req_with(vec![msg("user", "anything")], None);
+        req.metadata = Some(Metadata {
+            user_id: Some("user_abc_account__session_deadbeef".to_string()),
+        });
+        assert_eq!(isolation_seed(&req, 0), "sess:deadbeef");
+    }
+
+    // ---- creation 塌陷复现（seed 碰撞 + 高水位）--------------------------------
+
+    /// 复现 216 实测病象：同一 key 下多个**不同对话**共用一条 `key:N` seed（客户端不带
+    /// `_session_`，isolation_seed 回退到 key 级）。observe_session 存消息条数**高水位**，
+    /// 一旦某个长对话把水位顶高，之后同 key 上任何**更短对话的请求**都满足 `prev_n >= n-1`
+    /// → creation 区间 `msg_est[prev_n.min(n-1) .. n-1]` 塌成空 → creation=0。
+    ///
+    /// 这正是 98.3% 请求 cache_creation=0、read 占比 99.5% 的根因：短对话的合法新增被
+    /// 长对话的历史高水位吞掉，全塞进便宜的 read 桶，贵的 creation 桶几乎永不产生。
+    #[test]
+    fn creation_collapses_when_conversations_share_key_seed() {
+        // 两个 message 大小一致，便于用条数直接推断 creation 区间。
+        let seed = "key:0"; // 无 _session_ 时的 fallback seed
+        let g = MeterGovernance::new(1.0, 3600);
+
+        // 对话 A：一个很长的 agent 对话，把高水位顶到 40 条。
+        assert_eq!(g.observe_session(seed, 1_000, 40), None, "A 首次出现 → cold");
+        // A 继续，warm，返回高水位 40。
+        assert_eq!(g.observe_session(seed, 1_010, 42), Some(40), "A 第二轮 warm，prev_n=40");
+
+        // 对话 B：一个**全新的短对话**，但共用同一 key seed。它的第 2 轮只有 4 条消息，
+        // 本该把「上次后新增的中间消息」计入 creation。但 observe_session 返回的是**高水位 40**，
+        // 远大于 B 的消息数 4。
+        let prev_n_for_b = g
+            .observe_session(seed, 1_020, 4)
+            .expect("同 key 且 TTL 内 → warm");
+        assert_eq!(prev_n_for_b, 42, "B 拿到的是被 A 顶高的水位，而非 B 自己的历史");
+
+        // 用这个被污染的 prev_n 计算 B 的一轮真实对话（4 条：u,a,u,a → 末条为 input，
+        // 中间的 a(索引1)、u(索引2) 本应计 creation）。
+        let big = "x".repeat(4000);
+        let b_req = req_with(
+            vec![
+                msg("user", &big),      // 0
+                msg("assistant", &big), // 1  ← 本应计 creation
+                msg("user", &big),      // 2  ← 本应计 creation
+                msg("assistant", &big), // 3  ← input（末条）
+            ],
+            None,
+        );
+        let n = b_req.messages.len(); // 4
+        assert!(prev_n_for_b >= n - 1, "被污染的 prev_n({}) >= n-1({})", prev_n_for_b, n - 1);
+
+        let usage = compute_structural_cache_usage(&b_req, 1.0, Some(prev_n_for_b));
+        // BUG：creation 区间 = msg_est[min(42, 3) .. 3] = msg_est[3..3] = 空 → 0。
+        assert_eq!(
+            usage.creation_est, 0,
+            "复现塌陷：B 的合法新增(msg 1,2)被 A 的高水位吞掉 → creation=0"
+        );
+
+        // 对照：若 B 用自己真实的上轮条数(2)计算，creation 应覆盖 msg[2]（非零）。
+        let correct = compute_structural_cache_usage(&b_req, 1.0, Some(2));
+        assert!(
+            correct.creation_est > 0,
+            "正确隔离下 B 的新增应计入 creation（当前实现因 seed 碰撞算成 0）"
+        );
     }
 }
