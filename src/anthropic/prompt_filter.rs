@@ -176,6 +176,7 @@ mod tests {
             cache_read_ratio: None,
             anthropic_billing_mode: false,
             cache_creation_reflow: None,
+            anthropic_input_tokens: None,
             key_source: TraceKeySource::ClientKey,
         }
     }

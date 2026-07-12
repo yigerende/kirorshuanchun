@@ -78,9 +78,13 @@ pub struct ClientKey {
     #[serde(default, skip_serializing_if = "is_false")]
     pub anthropic_billing_mode: bool,
     /// 利润控制器·创建回流 Cb per-key 覆盖 ∈ [0,1]（None = 跟随全局默认 0；仅标准模式生效）。
-    /// read 被 R 砍掉的溢出量按 Cb 进 creation（贵桶 1.25x）、其余进 input。老数据无此字段时为 None。
+    /// read 被 Cb 升级进 creation（贵桶 1.25x）。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_reflow: Option<f64>,
+    /// Anthropic 标准计费模式下钉住的 input token 数 per-key 覆盖（None = 跟随默认 2；仅标准模式生效）。
+    /// 复现真实 Anthropic 暖缓存 input 为小常数的口径。老数据无此字段时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_input_tokens: Option<i32>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -257,6 +261,7 @@ impl ClientKeyManager {
             cache_read_ratio: None,
             anthropic_billing_mode: false,
             cache_creation_reflow: None,
+            anthropic_input_tokens: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -339,6 +344,7 @@ impl ClientKeyManager {
                     cache_read_ratio: None,
                     anthropic_billing_mode: false,
                     cache_creation_reflow: None,
+                    anthropic_input_tokens: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -399,6 +405,7 @@ impl ClientKeyManager {
         cache_read_ratio: Option<Option<f64>>,
         anthropic_billing_mode: Option<bool>,
         cache_creation_reflow: Option<Option<f64>>,
+        anthropic_input_tokens: Option<Option<i32>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -441,6 +448,10 @@ impl ClientKeyManager {
                 if let Some(v) = cache_creation_reflow {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局默认
                     e.cache_creation_reflow = v.map(|r| r.clamp(0.0, 1.0));
+                }
+                if let Some(v) = anthropic_input_tokens {
+                    // clamp 到 >=1；Some(None) 清除覆盖、跟随默认 2
+                    e.anthropic_input_tokens = v.map(|t| t.max(1));
                 }
                 true
             }
@@ -508,6 +519,15 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .and_then(|e| e.cache_creation_reflow)
+    }
+
+    /// 返回指定 Key 标准模式钉住的 input token 数覆盖（None = 跟随默认 2；Key 不存在时也返回 None）。
+    pub fn anthropic_input_tokens_of(&self, id: u64) -> Option<i32> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.anthropic_input_tokens)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -793,6 +813,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             None
         ));
         assert!(mgr.cache_enabled_of(entry.id));
@@ -819,6 +840,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -833,6 +855,7 @@ mod tests {
             None,
             None,
             Some(Some(0)),
+            None,
             None,
             None,
             None,

@@ -411,6 +411,8 @@ export interface ClientKeyItem {
   anthropicBillingMode?: boolean
   /** 利润控制器·创建回流 Cb 覆盖 ∈ [0,1]（undefined = 跟随全局默认 0；仅标准模式生效） */
   cacheCreationReflow?: number
+  /** 标准模式钉住的 input token 数覆盖（undefined = 跟随默认 2；仅标准模式生效） */
+  anthropicInputTokens?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -456,6 +458,8 @@ export interface UpdateClientKeyRequest {
   anthropicBillingMode?: boolean
   /** 利润控制器·创建回流 Cb 覆盖更新 ∈ [0,1]（省略=不变更；null=复位；数值=强制） */
   cacheCreationReflow?: number | null
+  /** 标准模式钉住 input token 数覆盖更新（省略=不变更；null=复位跟随默认 2；数值=强制,>=1） */
+  anthropicInputTokens?: number | null
 }
 
 // ============ 用量统计 ============

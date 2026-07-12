@@ -884,6 +884,9 @@ pub struct ClientKeyItem {
     /// 利润控制器·创建回流 Cb 覆盖 ∈ [0,1]（None = 跟随全局默认）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_reflow: Option<f64>,
+    /// 标准模式钉住 input token 数覆盖（None = 跟随默认 2）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_input_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -963,6 +966,9 @@ pub struct UpdateClientKeyRequest {
     /// - 数值 → `Some(Some(v))`：强制该 Key 的 Cb（clamp 到 [0,1]）
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub cache_creation_reflow: Option<Option<f64>>,
+    /// 标准模式钉住 input token 数覆盖更新（省略=不变更；null=复位跟随默认 2；数值=强制，>=1）。
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub anthropic_input_tokens: Option<Option<i32>>,
 }
 
 /// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。

@@ -501,6 +501,9 @@ pub(crate) fn compute_cache_usage_for_key(
     usage.billing_mode = key_ctx.anthropic_billing_mode;
     if usage.billing_mode {
         usage.creation_reflow = key_ctx.cache_creation_reflow.unwrap_or(0.0);
+        usage.pinned_input = key_ctx
+            .anthropic_input_tokens
+            .unwrap_or(super::cache_metering::DEFAULT_PINNED_INPUT);
     }
     usage
 }
