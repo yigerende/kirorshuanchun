@@ -76,9 +76,9 @@ export function ClientKeysPage() {
   const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
   // 缓存命中率 R 覆盖：空串=跟随全局，否则 0~1
   const [editCacheRatio, setEditCacheRatio] = useState('')
-  // Anthropic 标准计费模式开关（默认关）+ 利润控制器·创建回流 Cb（空串=跟随全局默认 0）
+  // Anthropic 标准计费模式开关（默认关）+ 利润控制器·read 膨胀系数 p（空串=跟随默认 0.2）
   const [editBillingMode, setEditBillingMode] = useState(false)
-  const [editReflow, setEditReflow] = useState('')
+  const [editInflation, setEditInflation] = useState('')
   // 标准模式钉住的 input token 数（空串=跟随默认 2）
   const [editInputTokens, setEditInputTokens] = useState('')
 
@@ -193,7 +193,7 @@ export function ClientKeysPage() {
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditBillingMode(item.anthropicBillingMode ?? false)
-    setEditReflow(item.cacheCreationReflow != null ? String(item.cacheCreationReflow) : '')
+    setEditInflation(item.cacheReadInflation != null ? String(item.cacheReadInflation) : '')
     setEditInputTokens(item.anthropicInputTokens != null ? String(item.anthropicInputTokens) : '')
     setEditOpen(true)
   }
@@ -217,11 +217,11 @@ export function ClientKeysPage() {
       toast.error('缓存命中率需在 0..=1，或留空跟随全局')
       return
     }
-    // 创建回流 Cb：空串→null（复位跟随全局默认 0）；否则 0~1
-    const reflowRaw = editReflow.trim()
-    const cacheCreationReflow = reflowRaw === '' ? null : parseFloat(reflowRaw)
-    if (reflowRaw !== '' && (isNaN(cacheCreationReflow as number) || (cacheCreationReflow as number) < 0 || (cacheCreationReflow as number) > 1)) {
-      toast.error('创建回流 Cb 需在 0..=1，或留空跟随全局默认')
+    // read 膨胀系数 p：空串→null（复位跟随默认 0.2）；否则 0~9
+    const inflRaw = editInflation.trim()
+    const cacheReadInflation = inflRaw === '' ? null : parseFloat(inflRaw)
+    if (inflRaw !== '' && (isNaN(cacheReadInflation as number) || (cacheReadInflation as number) < 0 || (cacheReadInflation as number) > 9)) {
+      toast.error('read 膨胀系数 p 需在 0..=9，或留空跟随默认 0.2')
       return
     }
     // 标准模式 input token：空串→null（复位跟随默认 2）；否则 >=1 的整数
@@ -246,7 +246,7 @@ export function ClientKeysPage() {
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
           anthropicBillingMode: editBillingMode,
-          cacheCreationReflow,
+          cacheReadInflation,
           anthropicInputTokens,
         },
       })
@@ -632,19 +632,19 @@ export function ClientKeysPage() {
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm">利润·创建回流 Cb 覆盖</div>
+                    <div className="text-sm">利润·read 膨胀系数 p 覆盖</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局默认 0；0~1。标准模式下 input 恒定，利润全靠此旋钮：把 read（便宜 0.1x）按 Cb 升级成 creation（贵 1.25x）。Cb=0＝纯真实 Anthropic，Cb=1＝read 全升级（利润最大）。仅标准计费模式生效。
+                      留空＝默认 0.2（+20%）；0~9。标准模式下把便宜的 cache_read（0.1x）超报 ×(1+p) 出利润。input 恒定、creation 保持自然小值（约 3%），利润只藏在 read。p=0＝纯真实 Anthropic，p 越大利润越高（上报总量随之超真实）。仅标准计费模式生效。
                     </p>
                   </div>
                   <Input
                     type="number"
                     min={0}
-                    max={1}
-                    step={0.05}
-                    placeholder="跟随全局"
-                    value={editReflow}
-                    onChange={(e) => setEditReflow(e.target.value)}
+                    max={9}
+                    step={0.1}
+                    placeholder="默认 0.2"
+                    value={editInflation}
+                    onChange={(e) => setEditInflation(e.target.value)}
                     disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
                     className="h-8 w-28 text-xs"
                   />

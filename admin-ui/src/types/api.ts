@@ -409,8 +409,8 @@ export interface ClientKeyItem {
   cacheReadRatio?: number
   /** Anthropic 标准计费模式（默认 false）：usage 走真实 Anthropic 口径 + 利润控制器 */
   anthropicBillingMode?: boolean
-  /** 利润控制器·创建回流 Cb 覆盖 ∈ [0,1]（undefined = 跟随全局默认 0；仅标准模式生效） */
-  cacheCreationReflow?: number
+  /** 利润控制器·read 膨胀系数 p 覆盖 ≥0（undefined = 跟随默认 0；仅标准模式生效）。read×(1+p) 超报 */
+  cacheReadInflation?: number
   /** 标准模式钉住的 input token 数覆盖（undefined = 跟随默认 2；仅标准模式生效） */
   anthropicInputTokens?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
@@ -456,8 +456,8 @@ export interface UpdateClientKeyRequest {
   cacheReadRatio?: number | null
   /** Anthropic 标准计费模式开关更新（省略=不变更；true/false=开关） */
   anthropicBillingMode?: boolean
-  /** 利润控制器·创建回流 Cb 覆盖更新 ∈ [0,1]（省略=不变更；null=复位；数值=强制） */
-  cacheCreationReflow?: number | null
+  /** 利润控制器·read 膨胀系数 p 覆盖更新 ≥0（省略=不变更；null=复位；数值=强制 read×(1+p)） */
+  cacheReadInflation?: number | null
   /** 标准模式钉住 input token 数覆盖更新（省略=不变更；null=复位跟随默认 2；数值=强制,>=1） */
   anthropicInputTokens?: number | null
 }

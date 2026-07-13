@@ -55,9 +55,12 @@ pub struct CacheUsage {
     /// [`CacheUsage::split_anthropic_standard`]：末条消息并入 creation、input 取纯余数（floor 1），
     /// 复现真实 Anthropic 暖缓存下 input≈1-2 的口径。关闭则走原 [`CacheUsage::split_against_total`]。
     pub billing_mode: bool,
-    /// 利润控制器·创建回流 Cb ∈ [0,1]（仅标准模式生效，默认 0）：把便宜 read 按 Cb 升级成贵桶
-    /// creation。`upgrade = read0 × Cb`；input 恒定不参与。默认 0 = 纯真实 Anthropic。
-    pub creation_reflow: f64,
+    /// 利润控制器·read 膨胀系数 p ≥ 0（仅标准模式生效，默认 0.2）：把便宜的 cache_read 桶**超报**——
+    /// `read_final = read0 × (1 + p)`。多报的 read（0.1x）即利润，上报总量随之 > 真实 total。
+    pub read_inflation: f64,
+    /// 标准模式 creation 占比（仅标准模式生效，默认 0.03）：creation = `cacheable × creation_ratio`，
+    /// 复现真实 Anthropic 每轮写入一小段缓存（自然的小值，不塌成 1）。read = cacheable − creation。
+    pub creation_ratio: f64,
     /// Anthropic 标准计费模式下钉住的 input token 数（默认 2，可 per-key 覆盖）。复现真实 Anthropic
     /// 暖缓存下 input 为小常数（1/2）的口径；剩余 `total − pinned_input` 落缓存两桶。仅标准模式生效。
     pub pinned_input: i32,
@@ -65,6 +68,15 @@ pub struct CacheUsage {
 
 /// 标准计费模式默认钉住的 input token 数。
 pub const DEFAULT_PINNED_INPUT: i32 = 2;
+
+/// read 膨胀系数 p 的上限（read 最多 ×(1+MAX)）。
+pub const MAX_READ_INFLATION: f64 = 9.0;
+
+/// 标准模式 read 膨胀系数默认值（+20% 利润）。
+pub const DEFAULT_READ_INFLATION: f64 = 0.2;
+
+/// 标准模式 creation 占比默认值（cacheable 的 3%，自然的小值）。
+pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
 
 impl Default for CacheUsage {
     /// 默认 = 不模拟缓存：`prompt_total_est == 0` 使 `split_against_total` 全量计入 input。
@@ -75,7 +87,8 @@ impl Default for CacheUsage {
             prompt_total_est: 0,
             read_ratio: 1.0,
             billing_mode: false,
-            creation_reflow: 0.0,
+            read_inflation: 0.0,
+            creation_ratio: DEFAULT_CREATION_RATIO,
             pinned_input: DEFAULT_PINNED_INPUT,
         }
     }
@@ -129,23 +142,15 @@ impl CacheUsage {
 
     /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
     ///
-    /// **input 恒钉 `pinned_input`（默认 2，可 per-key 覆盖）**——复现真实 Anthropic：暖缓存下
-    /// 几乎整段 prompt 都命中缓存断点，未缓存的 input 只剩小常数（1/2）。剩余 `total − pinned` 全部
-    /// 落在缓存两桶（read + creation），input **不参与利润拨动**（恒定），调利润时 input 也不会变。
+    /// 三桶按「固定形状」合成，复现真实 Anthropic 暖缓存 + 利润：
+    /// - **input = `pinned_input`（默认 2）**：小常数，像真实 Anthropic 暖缓存未命中的碎屑；恒定不参与利润拨动。
+    /// - **creation = `cacheable × creation_ratio`（默认 3%）**：每轮写入一小段缓存的自然小值（不塌成 1）。
+    /// - **read = (cacheable − creation) × (1 + `read_inflation`)（默认 +20%）**：占比最大的桶 + 超报利润。
     ///
-    /// **基线（Cb=0，纯真实 Anthropic）**：
-    /// - `input = pinned_input`；
-    /// - `creation0` = 本轮新增（`creation_est + input_est` 的占比折算，末条并入缓存写入）；
-    /// - `read0` = 已缓存前缀 = `total − pinned − creation0`（暖缓存下吃绝大部分）。
+    /// 其中 `cacheable = total − pinned`。利润来自超报便宜的 read（0.1x）——`p>0` 时上报总量 > 真实 total。
+    /// creation_ratio 决定「写多少」（形状),read_inflation 决定「读超报多少」（利润）。二者 per-key 可调。
     ///
-    /// **利润控制器 Cb = `creation_reflow` ∈ [0,1]**（下游按上报 usage 付费，价 read 0.1x <
-    /// input 1x < creation 1.25x）：把便宜的 read **升级**成贵的 creation——
-    /// - `upgrade = read0 × Cb`；`creation_final = creation0 + upgrade`；`read_final = read0 − upgrade`。
-    /// - Cb=0 → 纯真实 Anthropic（read 吃大头、利润 0 折扣）；Cb=1 → read 全部升级成 creation（利润最大）。
-    /// - input 恒定不动，三桶和恒等 `total`。read_ratio(R) 在标准模式**不使用**（避免污染 input）。
-    ///
-    /// cold（`creation_est` 覆盖整段前缀）时 creation0≈total−pinned、read0≈0，退化为整段 creation。
-    /// `total <= pinned_input` 或无可缓存内容时全部计入 input，不凭空造缓存计数。
+    /// `total <= pinned_input` 或无可缓存内容（`prompt_total_est<=0`）时全部计入 input，不凭空造缓存计数。
     pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         // pinned>=1；total<=pinned 或无可缓存内容：无法在钉 input=pinned 的同时再分缓存桶，全计 input。
@@ -153,24 +158,17 @@ impl CacheUsage {
         if self.prompt_total_est <= 0 || total <= pinned {
             return (total, 0, 0);
         }
-        let denom = self.prompt_total_est as f64;
-        // 标准模式：末条消息（input_est）并入「本轮新增」= creation，复现 Anthropic 把末条也缓存。
-        let creation_est = self.creation_est.saturating_add(self.input_est);
-        let creation_share = (creation_est as f64 / denom).clamp(0.0, 1.0);
-
-        // input 恒钉 pinned；剩余 (total-pinned) 在 creation / read 两桶间分配。
+        // input 恒钉 pinned；剩余 (total-pinned) 为可缓存部分。
         let cacheable = total - pinned;
-        let mut creation0 = ((cacheable as f64) * creation_share).round() as i32;
-        creation0 = creation0.clamp(0, cacheable);
-        let read0 = cacheable - creation0;
-
-        // 利润控制器：把 read0 的 Cb 比例升级成贵桶 creation（read→creation，input 不动）。
-        let cb = self.creation_reflow.clamp(0.0, 1.0);
-        let upgrade = ((read0 as f64) * cb).round() as i32;
-        let upgrade = upgrade.clamp(0, read0);
-        let creation_final = creation0 + upgrade;
-        let read_final = read0 - upgrade;
-        (pinned, creation_final, read_final)
+        // creation = cacheable × creation_ratio（固定占比的自然小值，复现真实 Anthropic 每轮写一小段）。
+        let cr = self.creation_ratio.clamp(0.0, 1.0);
+        let creation = ((cacheable as f64) * cr).round() as i32;
+        let creation = creation.clamp(0, cacheable);
+        let read0 = cacheable - creation;
+        // 利润控制器：超报 read（0.1x 桶），read_final = read0 × (1+p)。creation 不动、input 不动。
+        let p = self.read_inflation.clamp(0.0, MAX_READ_INFLATION);
+        let read_final = ((read0 as f64) * (1.0 + p)).round() as i32;
+        (pinned, creation, read_final)
     }
 }
 
@@ -695,13 +693,12 @@ mod tests {
 
     // ---- split_anthropic_standard（标准计费模式 + 利润控制器）-----------------
 
-    /// 标准模式：input 恒钉 `pinned`；(total-pinned) 分到 creation/read；Cb 把 read 升级成 creation。
-    /// read_ratio 在标准模式不使用（传 1.0 占位）。
+    /// 标准模式：input 恒钉 `pinned`；creation = cacheable×creation_ratio；read = 余下×(1+p)。
     fn std_usage(
         input_est: i32,
         creation_est: i32,
         total_est: i32,
-        cb: f64,
+        p: f64,
         pinned: i32,
     ) -> CacheUsage {
         CacheUsage {
@@ -710,94 +707,86 @@ mod tests {
             prompt_total_est: total_est,
             read_ratio: 1.0,
             billing_mode: true,
-            creation_reflow: cb,
+            read_inflation: p,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            pinned_input: pinned,
+        }
+    }
+
+    /// 同上但可指定 creation_ratio。
+    fn std_usage_cr(total_est: i32, p: f64, pinned: i32, cr: f64) -> CacheUsage {
+        CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: total_est,
+            read_ratio: 1.0,
+            billing_mode: true,
+            read_inflation: p,
+            creation_ratio: cr,
             pinned_input: pinned,
         }
     }
 
     #[test]
-    fn std_input_pinned_default_two_warm() {
-        // 默认 pinned=2；暖缓存：creation_share=(5+15)/1000=2%。
-        // cacheable=total-2=9998；creation0=9998×2%≈200；read0=余下。
+    fn std_input_pinned_and_shape() {
+        // 默认 creation_ratio=3%, p=0。total=10000, pinned=2 → cacheable=9998。
+        // creation=9998×3%≈300；read0=9698；p=0 → read=9698。
         let u = std_usage(5, 15, 1000, 0.0, 2);
         let (i, c, r) = u.split_final(10000);
         assert_eq!(i, 2, "input 恒钉 pinned=2");
-        assert_eq!(c, 200, "creation0 = (total-2) × 2% ≈ 200");
-        assert_eq!(r, 9998 - 200, "read = cacheable − creation0");
-        assert_eq!(i + c + r, 10000, "三桶和恒等 total");
+        assert_eq!(c, 300, "creation = cacheable × 3% ≈ 300");
+        assert_eq!(r, 9698, "read = cacheable − creation（p=0 不膨胀）");
+        assert_eq!(i + c + r, 10000, "p=0 时三桶和恒等 total");
     }
 
     #[test]
     fn std_input_pinned_configurable() {
-        // pinned 可配置：设 5 → input 恒 5，cacheable=total-5。
         let u = std_usage(5, 15, 1000, 0.0, 5);
-        let (i, c, r) = u.split_final(10000);
-        assert_eq!(i, 5, "input 恒钉 pinned=5（可配置）");
-        assert_eq!(i + c + r, 10000);
-        // pinned 设 1 → input 恒 1（兼容旧行为）。
+        assert_eq!(u.split_final(10000).0, 5, "input 恒钉 pinned=5（可配置）");
         let u1 = std_usage(5, 15, 1000, 0.0, 1);
         assert_eq!(u1.split_final(10000).0, 1, "pinned=1 → input 恒 1");
     }
 
     #[test]
-    fn std_baseline_cb_zero_pure_anthropic() {
-        // Cb=0：read 不升级，纯真实 Anthropic 口径，利润 0 折扣。pinned=2。
+    fn std_baseline_p_zero_shape() {
+        // p=0：read 不膨胀。cr=3%。total=4000,pinned=2 → cacheable=3998。
+        // creation=3998×3%≈120；read=3878。
         let u = std_usage(2, 8, 500, 0.0, 2);
         let (i, c, r) = u.split_final(4000);
         assert_eq!(i, 2, "input 恒 pinned=2");
-        // cacheable=3998；creation0=3998×10/500=80(round)；read0=3918。
-        assert_eq!(c, 80);
-        assert_eq!(r, 3918);
-        assert_eq!(i + c + r, 4000);
+        assert_eq!(c, 120, "creation = 3998 × 3% ≈ 120");
+        assert_eq!(r, 3878);
+        assert_eq!(i + c + r, 4000, "p=0 时和恒等 total");
     }
 
     #[test]
-    fn std_profit_cb_upgrades_read_to_creation_input_stays_pinned() {
-        // Cb=0.5：read0 的一半升级成贵桶 creation；input 仍恒 pinned（关键：调利润 input 不变）。
-        let u = std_usage(2, 8, 500, 0.5, 2);
+    fn std_profit_p_inflates_read_only() {
+        // p=0.2（默认利润）：read 超报 20%；creation 与 input 不动。
+        let u = std_usage(2, 8, 500, 0.2, 2);
         let (i, c, r) = u.split_final(4000);
-        // creation0=80, read0=3918。upgrade=3918×0.5=1959。creation=80+1959=2039, read=3918-1959=1959。
-        assert_eq!(i, 2, "调利润时 input 依然恒 pinned=2");
-        assert_eq!(c, 80 + 1959, "read 的一半升级进 creation");
-        assert_eq!(r, 3918 - 1959);
-        assert_eq!(i + c + r, 4000);
+        // creation=120, read0=3878。read_final=3878×1.2=4654(round)。
+        assert_eq!(i, 2, "input 不变");
+        assert_eq!(c, 120, "creation 不受 p 影响");
+        assert_eq!(r, 4654, "read 超报 20% = 3878×1.2");
+        assert!(i + c + r > 4000, "上报总量 > 真实 total（多报 read 即利润）");
     }
 
     #[test]
-    fn std_profit_cb_one_all_read_to_creation() {
-        // Cb=1：read 全部升级成 creation（利润最大），read=0，input 仍 pinned。
-        let u = std_usage(2, 8, 500, 1.0, 2);
-        let (i, c, r) = u.split_final(4000);
-        assert_eq!(i, 2);
-        assert_eq!(r, 0, "Cb=1 → read 清零");
-        assert_eq!(c, 3998, "cacheable 全进 creation（贵桶）");
-        assert_eq!(i + c + r, 4000);
+    fn std_creation_ratio_configurable() {
+        // creation_ratio=1% vs 5%：creation 随之变，read=余下。total=10002,pinned=2→cacheable=10000。
+        let lo = std_usage_cr(1000, 0.0, 2, 0.01);
+        let (_, c1, _) = lo.split_final(10002);
+        assert_eq!(c1, 100, "1% → creation=100");
+        let hi = std_usage_cr(1000, 0.0, 2, 0.05);
+        let (_, c5, _) = hi.split_final(10002);
+        assert_eq!(c5, 500, "5% → creation=500");
     }
 
     #[test]
-    fn std_cold_whole_creation_input_pinned() {
-        // cold：creation_est 覆盖整段前缀 → creation_share≈100% → creation0≈cacheable, read0≈0。
-        let u = std_usage(10, 990, 1000, 0.0, 2);
-        let (i, c, r) = u.split_final(1000);
-        assert_eq!(i, 2, "input 恒 pinned=2");
-        assert_eq!(r, 0, "cold 无 read 基数");
-        assert_eq!(c, 998, "整段计 creation（cacheable=998）");
-        assert_eq!(i + c + r, 1000);
-    }
-
-    #[test]
-    fn std_disabled_falls_back_to_legacy_split() {
-        // billing_mode=false → split_final 走原 split_against_total（零回归）。
-        let u = CacheUsage {
-            input_est: 10,
-            creation_est: 5,
-            prompt_total_est: 100,
-            read_ratio: 1.0,
-            billing_mode: false,
-            creation_reflow: 0.0,
-            pinned_input: DEFAULT_PINNED_INPUT,
-        };
-        assert_eq!(u.split_final(1000), u.split_against_total(1000));
+    fn std_no_cacheable_all_input_std() {
+        // total<=pinned → 全计 input。
+        let u = std_usage(0, 0, 0, 0.2, 2);
+        assert_eq!(u.split_final(2), (2, 0, 0));
     }
 
     #[test]

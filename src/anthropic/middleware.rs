@@ -39,8 +39,8 @@ pub struct KeyContext {
     pub cache_read_ratio: Option<f64>,
     /// Anthropic 标准计费模式（per-key，默认关）。开启后 usage 走真实 Anthropic 口径 + 利润控制器。
     pub anthropic_billing_mode: bool,
-    /// 利润控制器·创建回流 Cb per-key 覆盖（None = 跟随全局默认 0；仅标准模式生效）。
-    pub cache_creation_reflow: Option<f64>,
+    /// 利润控制器·read 膨胀系数 p per-key 覆盖（None = 跟随默认 0；仅标准模式生效）。read×(1+p) 超报。
+    pub cache_read_inflation: Option<f64>,
     /// 标准模式钉住的 input token 数 per-key 覆盖（None = 跟随默认 2；仅标准模式生效）。
     pub anthropic_input_tokens: Option<i32>,
     /// 命中的入口 Key 类型。
@@ -175,7 +175,7 @@ pub async fn auth_middleware(
             let (response_cache_enabled, response_cache_ttl_secs) = mgr.response_cache_cfg_of(id);
             let cache_read_ratio = mgr.cache_read_ratio_of(id);
             let anthropic_billing_mode = mgr.anthropic_billing_mode_of(id);
-            let cache_creation_reflow = mgr.cache_creation_reflow_of(id);
+            let cache_read_inflation = mgr.cache_read_inflation_of(id);
             let anthropic_input_tokens = mgr.anthropic_input_tokens_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
@@ -188,7 +188,7 @@ pub async fn auth_middleware(
                 response_cache_ttl_secs,
                 cache_read_ratio,
                 anthropic_billing_mode,
-                cache_creation_reflow,
+                cache_read_inflation,
                 anthropic_input_tokens,
                 key_source: TraceKeySource::ClientKey,
             });

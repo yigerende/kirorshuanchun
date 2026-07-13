@@ -497,13 +497,17 @@ pub(crate) fn compute_cache_usage_for_key(
     let mut usage =
         super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count);
     // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实 Anthropic 口径 +
-    // 利润控制器（Cb 回流）。关闭时 billing_mode=false，split_final 退回原比例分摊（零回归）。
+    // 利润控制器（p 超报 read）。关闭时 billing_mode=false，split_final 退回原比例分摊（零回归）。
     usage.billing_mode = key_ctx.anthropic_billing_mode;
     if usage.billing_mode {
-        usage.creation_reflow = key_ctx.cache_creation_reflow.unwrap_or(0.0);
+        // read 膨胀系数 p：per-key 覆盖优先，否则默认 +20%（DEFAULT_READ_INFLATION）。
+        usage.read_inflation = key_ctx
+            .cache_read_inflation
+            .unwrap_or(super::cache_metering::DEFAULT_READ_INFLATION);
         usage.pinned_input = key_ctx
             .anthropic_input_tokens
             .unwrap_or(super::cache_metering::DEFAULT_PINNED_INPUT);
+        // creation_ratio 已由 CacheUsage::default() 设为 DEFAULT_CREATION_RATIO（3%），无需覆盖。
     }
     usage
 }

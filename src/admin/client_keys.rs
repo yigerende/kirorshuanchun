@@ -77,10 +77,10 @@ pub struct ClientKey {
     /// 关闭（默认）则走原比例分摊，行为与今天一致。老数据无此字段时默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub anthropic_billing_mode: bool,
-    /// 利润控制器·创建回流 Cb per-key 覆盖 ∈ [0,1]（None = 跟随全局默认 0；仅标准模式生效）。
-    /// read 被 Cb 升级进 creation（贵桶 1.25x）。老数据无此字段时为 None。
+    /// 利润控制器·read 膨胀系数 p per-key 覆盖 ≥0（None = 跟随默认 0；仅标准模式生效）。
+    /// read_final = read0 × (1+p) 超报便宜的 cache_read（0.1x）出利润。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_reflow: Option<f64>,
+    pub cache_read_inflation: Option<f64>,
     /// Anthropic 标准计费模式下钉住的 input token 数 per-key 覆盖（None = 跟随默认 2；仅标准模式生效）。
     /// 复现真实 Anthropic 暖缓存 input 为小常数的口径。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,7 +260,7 @@ impl ClientKeyManager {
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
             anthropic_billing_mode: false,
-            cache_creation_reflow: None,
+            cache_read_inflation: None,
             anthropic_input_tokens: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
@@ -343,7 +343,7 @@ impl ClientKeyManager {
                     response_cache_ttl_secs: None,
                     cache_read_ratio: None,
                     anthropic_billing_mode: false,
-                    cache_creation_reflow: None,
+                    cache_read_inflation: None,
                     anthropic_input_tokens: None,
                     total_credits: 0.0,
                     group: None,
@@ -404,7 +404,7 @@ impl ClientKeyManager {
         response_cache_ttl_secs: Option<Option<u32>>,
         cache_read_ratio: Option<Option<f64>>,
         anthropic_billing_mode: Option<bool>,
-        cache_creation_reflow: Option<Option<f64>>,
+        cache_read_inflation: Option<Option<f64>>,
         anthropic_input_tokens: Option<Option<i32>>,
     ) -> bool {
         let mut inner = self.inner.write();
@@ -445,9 +445,10 @@ impl ClientKeyManager {
                 if let Some(v) = anthropic_billing_mode {
                     e.anthropic_billing_mode = v;
                 }
-                if let Some(v) = cache_creation_reflow {
-                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局默认
-                    e.cache_creation_reflow = v.map(|r| r.clamp(0.0, 1.0));
+                if let Some(v) = cache_read_inflation {
+                    // clamp 到 [0, MAX]；Some(None) 清除覆盖、跟随全局默认
+                    e.cache_read_inflation =
+                        v.map(|r| r.clamp(0.0, super::super::anthropic::cache_metering::MAX_READ_INFLATION));
                 }
                 if let Some(v) = anthropic_input_tokens {
                     // clamp 到 >=1；Some(None) 清除覆盖、跟随默认 2
@@ -512,13 +513,13 @@ impl ClientKeyManager {
             .unwrap_or(false)
     }
 
-    /// 返回指定 Key 的创建回流 Cb 覆盖（None = 跟随全局默认；Key 不存在时也返回 None）。
-    pub fn cache_creation_reflow_of(&self, id: u64) -> Option<f64> {
+    /// 返回指定 Key 的 read 膨胀系数 p 覆盖（None = 跟随默认 0；Key 不存在时也返回 None）。
+    pub fn cache_read_inflation_of(&self, id: u64) -> Option<f64> {
         self.inner
             .read()
             .entries
             .get(&id)
-            .and_then(|e| e.cache_creation_reflow)
+            .and_then(|e| e.cache_read_inflation)
     }
 
     /// 返回指定 Key 标准模式钉住的 input token 数覆盖（None = 跟随默认 2；Key 不存在时也返回 None）。
