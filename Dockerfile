@@ -12,7 +12,7 @@ FROM rust:1.92-alpine AS builder
 # 需 cmake 编译 + libclang 跑 bindgen。alpine 的 clang 包自带 builtin headers(stddef.h 等)，
 # 无需额外 -I（区别于 pip libclang）。若 musl 下 BoringSSL 构建失败，回退方案见 README/memory：
 # 把本 stage 换成 rust:1.92-bookworm(glibc) + 对应 glibc runtime base。
-RUN apk add --no-cache musl-dev perl make cmake clang clang-dev llvm-dev g++ linux-headers
+RUN apk add --no-cache musl-dev perl make cmake clang clang-dev llvm-dev g++ linux-headers git
 ENV LIBCLANG_PATH=/usr/lib
 
 WORKDIR /app
