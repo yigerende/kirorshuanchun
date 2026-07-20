@@ -1221,7 +1221,9 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
+                            // 上游断流:标记中断,收尾发 `error` 事件而非伪造 end_turn 的 message_stop,
+                            // 让下游 agent 明确察觉响应被腰斩(而非当成正常完成)。
+                            ctx.mark_interrupted();
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
@@ -2137,6 +2139,8 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 上游断流:标记中断,收尾发 `error` 事件而非伪造正常 message_stop。
+                                ctx.mark_interrupted();
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
@@ -2359,7 +2363,8 @@ fn create_gated_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游断流：finish 把剩余（含未放闸时的 message_start+缓冲）吐出，记 interrupted。
-                            // 断流是非自洽响应，不写入缓存。
+                            // 断流是非自洽响应，不写入缓存。标记中断:收尾发 `error` 事件而非伪造 message_stop。
+                            ctx.mark_interrupted();
                             let final_events = ctx.finish();
                             let (i, o, cc, cr, credits) = ctx.final_usage();
                             hook.record(credential_id, i, o, cc, cr, credits, "error");

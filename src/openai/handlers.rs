@@ -300,6 +300,12 @@ fn finalize_stream(
     error_message: Option<&str>,
 ) -> Vec<Result<Bytes, Infallible>> {
     let mut out: Vec<Result<Bytes, Infallible>> = Vec::new();
+    let interrupted = status != "success";
+    // 断流:标记中断,让 generate_final_events 跳过 thinking / invoke-sniff 碎片的 flush
+    // (避免把半截标签当正文吐出),且不生成带 end_turn 假 stop_reason 的 message_delta。
+    if interrupted {
+        ctx.mark_interrupted();
+    }
     // flush 残余事件（关闭未闭合块、message_delta 捕获 stop_reason、可能的尾部 thinking_delta）
     for ev in ctx.generate_final_events() {
         for chunk_json in builder.push_event(&ev) {
@@ -307,7 +313,24 @@ fn finalize_stream(
         }
     }
     let usage = usage_from_ctx(ctx);
-    out.push(Ok(chunk_to_sse(&builder.finish_chunk(usage))));
+    if interrupted {
+        // 断流:发 OpenAI 风格的 error 数据帧作为明确的中断信号,而非伪造 finish_reason:"stop"
+        // 的正常 finish chunk。下游据此察觉响应被腰斩(而非当成正常完成),再补 [DONE] 关流。
+        // type 用 `server_error`(OpenAI 生态里 5xx 语义,客户端据此退避重试);
+        // 真实归因放 `code: upstream_interrupted` 便于诊断区分。
+        let err = json!({
+            "error": {
+                "type": "server_error",
+                "code": "upstream_interrupted",
+                "message": error_message.unwrap_or(
+                    "Upstream response stream ended before completion; the message was truncated (retryable)."
+                )
+            }
+        });
+        out.push(Ok(chunk_to_sse(&err)));
+    } else {
+        out.push(Ok(chunk_to_sse(&builder.finish_chunk(usage))));
+    }
     out.push(Ok(done_frame()));
 
     record_usage(hook, ctx, credential_id, status);

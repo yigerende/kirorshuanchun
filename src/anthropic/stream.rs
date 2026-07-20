@@ -894,6 +894,10 @@ pub struct SseStateManager {
     stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
+    /// 上游流被中断（断流 / 解码器停机 / 缓冲区溢出丢块）。置位后 `generate_final_events`
+    /// 改发 Anthropic 协议合法的 `error` 事件，而非伪造 `end_turn`/`tool_use` 的
+    /// `message_stop`——让下游 agent 能明确察觉“本次响应被腰斩”，而不是当成正常完成。
+    interrupted: bool,
 }
 
 impl Default for SseStateManager {
@@ -912,7 +916,18 @@ impl SseStateManager {
             next_block_index: 0,
             stop_reason: None,
             has_tool_use: false,
+            interrupted: false,
         }
+    }
+
+    /// 标记上游流被中断。收尾时会发 `error` 事件而非伪造的正常 `message_stop`。
+    pub fn mark_interrupted(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// 上游流是否已被标记为中断。
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted
     }
 
     /// 判断指定块是否处于可接收 delta 的打开状态
@@ -1078,6 +1093,31 @@ impl SseStateManager {
                 ));
                 block.stopped = true;
             }
+        }
+
+        // 断流:发协议合法的 `error` 事件作为明确的中断信号,不伪造正常 message_stop。
+        // 已关闭的 content_block_stop 保留在上面,让客户端能收下已到达的部分内容;
+        // 但不发 message_delta(会带 end_turn/tool_use 的假 stop_reason)、也不发 message_stop
+        // (Anthropic 语义里 message_stop == 正常完成)。下游据此判定“被腰斩”并可重试。
+        if self.interrupted {
+            if !self.message_ended {
+                self.message_ended = true;
+                // type 用 `overloaded_error`:Anthropic 生态里这是最强的“临时性、可重试”信号,
+                // 客户端 SDK / Claude Code 据此退避重发。message 写明真实归因(上游断流/腰斩),
+                // 便于诊断区分真过载(trace 侧另有 STREAM_INTERRUPTED 标记,归因不受影响)。
+                events.push(SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": "Upstream response stream ended before completion; \
+                                        the message was truncated (retryable)."
+                        }
+                    }),
+                ));
+            }
+            return events;
         }
 
         // 发送 message_delta
@@ -2166,8 +2206,27 @@ impl StreamContext {
     }
 
     /// 生成最终事件序列
+    /// 标记上游流被中断（断流 / 解码器停机 / 缓冲区溢出）。收尾改发 `error` 事件。
+    pub fn mark_interrupted(&mut self) {
+        self.state_manager.mark_interrupted();
+    }
+
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 中断收尾:跳过 thinking / invoke-sniff 缓冲的 flush。这些缓冲此刻可能持有
+        // 半截的 `<invoke …>` 或 `</thinking>` 标签(等后续 chunk 才能判定),中断时把它们
+        // 当正文吐出会让下游看到伪造的标签碎片。直接走 state_manager 收尾发 `error` 事件。
+        if self.state_manager.is_interrupted() {
+            let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+            events.extend(self.state_manager.generate_final_events(
+                final_input_tokens,
+                self.output_tokens,
+                cache_creation,
+                cache_read,
+            ));
+            return events;
+        }
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -2331,6 +2390,11 @@ impl BufferedStreamContext {
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
         self.event_buffer.extend(events);
+    }
+
+    /// 标记上游流被中断（断流 / 解码器停机 / 缓冲区溢出）。收尾改发 `error` 事件。
+    pub fn mark_interrupted(&mut self) {
+        self.inner.mark_interrupted();
     }
 
     /// 完成流处理并返回所有事件
@@ -2562,6 +2626,12 @@ impl GatedStreamContext {
     /// 当前响应的最终 stop_reason。响应缓存据此判定是否可缓存（只缓存 `end_turn`）。
     pub fn stop_reason(&self) -> String {
         self.inner.state_manager.get_stop_reason()
+    }
+
+    /// 标记上游流被中断（断流 / 解码器停机 / 缓冲区溢出）。之后 `finish()` 会发 `error`
+    /// 事件而非伪造正常 `message_stop`,让下游 agent 明确察觉响应被腰斩。
+    pub fn mark_interrupted(&mut self) {
+        self.inner.state_manager.mark_interrupted();
     }
 }
 
@@ -4465,6 +4535,75 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    // ===== 断流中断信号回归测试 =====
+
+    /// 断流:标记 interrupted 后收尾必须发 `error` 事件,且**不得**发伪造正常完成的
+    /// `message_stop` / `message_delta`(带 end_turn)。下游据此察觉响应被腰斩。
+    #[test]
+    fn test_interrupted_emits_error_not_fake_message_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("partial answer"));
+        // 上游在此断流
+        ctx.mark_interrupted();
+        all.extend(ctx.generate_final_events());
+
+        assert!(
+            all.iter().any(|e| e.event == "error"
+                && e.data["error"]["type"] == "overloaded_error"),
+            "中断收尾必须发可重试的 error/overloaded_error 事件, got: {:?}",
+            all.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert!(
+            !all.iter().any(|e| e.event == "message_stop"),
+            "中断时不得发伪造正常完成的 message_stop"
+        );
+        assert!(
+            !all.iter().any(|e| e.event == "message_delta"),
+            "中断时不得发带 end_turn/tool_use 假 stop_reason 的 message_delta"
+        );
+    }
+
+    /// 断流:invoke-sniff 缓冲里持有半截 `<invoke …>` 时,中断收尾**不得**把该半截标签
+    /// 当正文 flush 出去(否则下游看到伪造的工具调用标签碎片)。
+    #[test]
+    fn test_interrupted_does_not_flush_partial_invoke_tag() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        // 行首半截 invoke 开标签(无闭合 >),命中"疑似真泄漏"→留在 invoke_sniff_buffer 等后续 chunk。
+        all.extend(ctx.process_assistant_response("<invoke name=\"test_tool"));
+        // 此刻半截标签应被 hold,尚未作为正文吐出。
+        assert!(
+            !collect_text_content(&all).contains("<invoke"),
+            "前置条件:半截 <invoke 应被 hold 在缓冲区,不应已吐出"
+        );
+        ctx.mark_interrupted();
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        assert!(
+            !text.contains("<invoke"),
+            "中断时被 hold 的半截 <invoke 标签不得作为正文 flush 出去, got text: {:?}",
+            text
         );
     }
 
