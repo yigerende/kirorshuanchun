@@ -1,3 +1,3 @@
 ```cmd
-push-to-github.cmd
+.\push-to-github.cmd
 ```
