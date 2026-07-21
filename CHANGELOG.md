@@ -34,7 +34,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 生产 Caddy `encode zstd gzip` 把 `text/event-stream` 也压缩，Claude Code 解流式 zstd 帧
   失败 → 客户端 `ZstdDecompressionError`、流中断重试（生产日志 3084 条 SSE 带
   `Content-Encoding: zstd`）。属基础设施层，不在 Rust 代码内。
-- 修复方案与应用/回退步骤见 `docs/caddy-sse-no-compress.md`：`encode` 加
+- 修复方案与应用/回退步骤见 `docs/Caddy-SSE禁用压缩配置.md`：`encode` 加
   `match { not header Content-Type text/event-stream* }`，SSE 不压缩、其余仍压缩。
 
 ## [0.6.16] - 2026-06-25
@@ -137,7 +137,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 📝 文档
 
-- 新增 `docs/load-balancer-redesign.md`(基于生产 traces.db 实证的 adaptive 模式负载均衡重设计稿,待评审)、`docs/native-mode-optimization-implementation.md`(原生模式优化实施说明)。
+- 新增 `docs/负载均衡重构设计.md`（基于生产 traces.db 实证的 adaptive 模式负载均衡重设计稿，待评审）、`docs/原生模式优化实施说明.md`（原生模式优化实施说明）。
 
 ### ✅ 测试
 
