@@ -63,6 +63,16 @@ impl ProxyConfig {
         self.password = Some(password.into());
         self
     }
+
+    /// URL 是否为 SOCKS 代理（`socks4://` / `socks5://`，大小写不敏感）。
+    ///
+    /// 用于 TLS 指纹路径的选路：wreq(BoringSSL) 客户端未启用 `socks` 特性（见 Cargo.toml），
+    /// 把 `socks://` 交给它会建连失败或静默直连（泄露真实 IP）。识别到 SOCKS 时应回退到
+    /// 支持 socks 的 reqwest 主路径。reqwest 侧启用了 `socks` 特性，代理正常生效。
+    pub fn is_socks(&self) -> bool {
+        let u = self.url.trim_start().to_ascii_lowercase();
+        u.starts_with("socks4://") || u.starts_with("socks5://")
+    }
 }
 
 /// 构建 HTTP Client
@@ -189,6 +199,20 @@ mod tests {
         assert_eq!(config.url, "socks5://127.0.0.1:1080");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_config_is_socks() {
+        // socks4/socks5 视为 SOCKS，大小写不敏感、容忍前导空白。
+        assert!(ProxyConfig::new("socks5://127.0.0.1:1080").is_socks());
+        assert!(ProxyConfig::new("socks4://127.0.0.1:1080").is_socks());
+        assert!(ProxyConfig::new("SOCKS5://127.0.0.1:1080").is_socks());
+        assert!(ProxyConfig::new("  socks5://h:1080").is_socks());
+        // http/https 不是 SOCKS。
+        assert!(!ProxyConfig::new("http://127.0.0.1:7890").is_socks());
+        assert!(!ProxyConfig::new("https://127.0.0.1:7890").is_socks());
+        // 子串误匹配防护：host 里含 "socks" 不算。
+        assert!(!ProxyConfig::new("http://socks.example.com:8080").is_socks());
     }
 
     #[test]

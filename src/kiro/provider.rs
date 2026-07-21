@@ -565,9 +565,27 @@ impl KiroProvider {
         {
             let (fp_enabled, fp_profile) = self.token_manager.tls_fingerprint();
             if fp_enabled {
-                let client = self.wreq_client_for(credentials, streaming, &fp_profile)?;
-                let resp = send_via_wreq(&client, request).await?;
-                return Ok(UpstreamResponse::Wreq(resp));
+                // SOCKS 代理不能走 wreq(BoringSSL)：其 `socks` 特性未启用（见 Cargo.toml），
+                // 交给它会建连失败或静默直连、泄露真实服务器 IP。识别到 SOCKS 时回退到支持
+                // socks 的 reqwest 主路径——保代理有效（IP 不泄露），仅本次牺牲指纹伪装。
+                let global_proxy = self.token_manager.proxy();
+                let effective = credentials.effective_proxy(global_proxy.as_ref());
+                let is_socks = effective.as_ref().is_some_and(|p| p.is_socks());
+                if is_socks {
+                    // 每进程只告警一次，避免高频刷屏；代理仍生效，仅指纹被跳过。
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "TLS 指纹已开启，但生效代理为 SOCKS；wreq 未启用 socks 特性，\
+                             本次请求回退到 reqwest 路径（代理正常生效，跳过指纹伪装）。\
+                             如需在 SOCKS 下也伪装指纹，请改用 http/https 代理。"
+                        );
+                    }
+                } else {
+                    let client = self.wreq_client_for(credentials, streaming, &fp_profile)?;
+                    let resp = send_via_wreq(&client, request).await?;
+                    return Ok(UpstreamResponse::Wreq(resp));
+                }
             }
         }
         let resp = http_client.execute(request).await?;
