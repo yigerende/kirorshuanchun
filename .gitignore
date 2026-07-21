@@ -28,6 +28,9 @@
 /traces.db
 /traces.db-shm
 /traces.db-wal
+# 本地启动/重启日志
+/kiro-launch*.log
+/kiro-latest*.log
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
