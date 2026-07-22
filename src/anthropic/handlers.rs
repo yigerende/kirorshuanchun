@@ -1518,6 +1518,12 @@ async fn handle_non_stream_request(
     // creation 按入站 cache_control.ttl 归 5m / 1h 桶（顶层字段仍取总和以兼容旧口径）。
     let (creation_5m, creation_1h) = cache_usage.creation_split(cache_creation_tokens);
 
+    // 仅出站显示替换 0；下方 hook / trace 继续记录真实 final_input_tokens。
+    let downstream_input_tokens = crate::downstream_usage::replace_zero(
+        final_input_tokens,
+        crate::downstream_usage::policy().zero_replacement(),
+    );
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -1528,7 +1534,7 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
+            "input_tokens": downstream_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_creation_tokens,
             "cache_read_input_tokens": cache_read_tokens,
@@ -1702,7 +1708,10 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: crate::downstream_usage::replace_zero(
+            total_tokens,
+            crate::downstream_usage::policy().zero_replacement(),
+        ),
     })
 }
 

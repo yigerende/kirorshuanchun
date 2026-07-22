@@ -519,6 +519,14 @@ pub struct RuntimeGovernanceConfigResponse {
     /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
     /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
     pub cache_meter_ttl_secs: u64,
+    /// 下游输入 Token 为 0 时的替换模式：fixed / random。
+    pub downstream_input_token_mode: crate::downstream_usage::DownstreamInputTokenMode,
+    /// 固定模式替代值。
+    pub downstream_input_token_fixed: u32,
+    /// 随机模式闭区间下限。
+    pub downstream_input_token_random_min: u32,
+    /// 随机模式闭区间上限。
+    pub downstream_input_token_random_max: u32,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -540,6 +548,14 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub cache_meter_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub downstream_input_token_mode: Option<crate::downstream_usage::DownstreamInputTokenMode>,
+    #[serde(default)]
+    pub downstream_input_token_fixed: Option<u32>,
+    #[serde(default)]
+    pub downstream_input_token_random_min: Option<u32>,
+    #[serde(default)]
+    pub downstream_input_token_random_max: Option<u32>,
 }
 
 /// 端点路由配置响应：首选端点 + fallback 开关 + 可选端点清单。

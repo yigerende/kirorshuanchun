@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod downstream_usage;
 mod fingerprint_client;
 mod http_client;
 mod image_resize;
@@ -54,6 +55,13 @@ async fn main() {
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
+    });
+
+    downstream_usage::policy().configure(downstream_usage::DownstreamInputTokenSettings {
+        mode: config.downstream_input_token_mode,
+        fixed: config.downstream_input_token_fixed,
+        random_min: config.downstream_input_token_random_min,
+        random_max: config.downstream_input_token_random_max,
     });
 
     // 加载凭证（支持单对象或数组格式）

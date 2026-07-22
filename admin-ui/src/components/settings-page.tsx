@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { DatabaseZap, Filter, Shuffle, ShieldAlert, ScrollText, Waypoints } from 'lucide-react'
+import { DatabaseZap, Filter, Gauge, Shuffle, ShieldAlert, ScrollText, Waypoints } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -245,6 +245,108 @@ function CacheQuotaSection() {
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
         </form>
       </div>
+    </SettingSection>
+  )
+}
+
+// 下游 usage 兼容：只改最终响应中的 0 输入 Token
+function DownstreamInputTokenSection() {
+  const { data: cfg, isLoading } = useRuntimeGovernanceConfig()
+  const { mutate, isPending } = useSetRuntimeGovernanceConfig()
+  const [fixed, setFixed] = useState('')
+  const [randomMin, setRandomMin] = useState('')
+  const [randomMax, setRandomMax] = useState('')
+  const busy = isLoading || isPending
+  const mode = cfg?.downstreamInputTokenMode ?? 'fixed'
+
+  const save = (patch: Record<string, unknown>, ok: string) =>
+    mutate(patch, {
+      onSuccess: () => toast.success(ok),
+      onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
+    })
+
+  const parseToken = (raw: string) => {
+    const value = Number(raw)
+    return Number.isInteger(value) && value >= 1 && value <= 1_000_000 ? value : null
+  }
+
+  const saveFixed = (e: React.FormEvent) => {
+    e.preventDefault()
+    const value = parseToken(fixed)
+    if (value === null) {
+      toast.error('固定值需为 1..=1000000 的整数')
+      return
+    }
+    save({ downstreamInputTokenFixed: value }, '固定替代值已更新')
+    setFixed('')
+  }
+
+  const saveRange = (e: React.FormEvent) => {
+    e.preventDefault()
+    const min = parseToken(randomMin)
+    const max = parseToken(randomMax)
+    if (min === null || max === null || min > max) {
+      toast.error('随机区间需满足 1 <= 最小值 <= 最大值 <= 1000000')
+      return
+    }
+    save(
+      { downstreamInputTokenRandomMin: min, downstreamInputTokenRandomMax: max },
+      '随机替代区间已更新',
+    )
+    setRandomMin('')
+    setRandomMax('')
+  }
+
+  return (
+    <SettingSection
+      icon={<Gauge className="h-4 w-4 text-cyan-600" />}
+      title="下游输入 Token"
+      desc="仅当最终响应的输入 Token 为 0 时替换；请求日志与内部计费保持原值。"
+    >
+      <div className="inline-flex rounded-md border border-input p-0.5">
+        <Button
+          size="sm"
+          variant={mode === 'fixed' ? 'default' : 'ghost'}
+          className="h-7 text-xs"
+          disabled={busy}
+          onClick={() => save({ downstreamInputTokenMode: 'fixed' }, '已切换为固定值')}
+        >
+          固定值
+        </Button>
+        <Button
+          size="sm"
+          variant={mode === 'random' ? 'default' : 'ghost'}
+          className="h-7 text-xs"
+          disabled={busy}
+          onClick={() => save({ downstreamInputTokenMode: 'random' }, '已切换为随机区间')}
+        >
+          随机区间
+        </Button>
+      </div>
+
+      {mode === 'fixed' ? (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            固定替代值（当前 {cfg?.downstreamInputTokenFixed ?? '—'}）
+          </div>
+          <form onSubmit={saveFixed} className="flex items-center gap-1.5">
+            <Input type="number" min={1} max={1000000} step={1} placeholder="1" value={fixed} onChange={(e) => setFixed(e.target.value)} disabled={busy} className="h-8 max-w-[180px] text-xs" />
+            <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={busy || !fixed.trim()}>保存</Button>
+          </form>
+        </div>
+      ) : (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            随机闭区间（当前 {cfg ? `${cfg.downstreamInputTokenRandomMin} - ${cfg.downstreamInputTokenRandomMax}` : '—'}）
+          </div>
+          <form onSubmit={saveRange} className="flex flex-wrap items-center gap-1.5">
+            <Input type="number" min={1} max={1000000} step={1} placeholder="最小值" value={randomMin} onChange={(e) => setRandomMin(e.target.value)} disabled={busy} className="h-8 max-w-[150px] text-xs" />
+            <span className="text-xs text-muted-foreground">至</span>
+            <Input type="number" min={1} max={1000000} step={1} placeholder="最大值" value={randomMax} onChange={(e) => setRandomMax(e.target.value)} disabled={busy} className="h-8 max-w-[150px] text-xs" />
+            <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={busy || !randomMin.trim() || !randomMax.trim()}>保存</Button>
+          </form>
+        </div>
+      )}
     </SettingSection>
   )
 }
@@ -540,6 +642,7 @@ export function SettingsPage() {
       <div className="grid gap-5 lg:grid-cols-2">
         <EndpointRoutingSection />
         <CacheQuotaSection />
+        <DownstreamInputTokenSection />
         <PromptFilterSection />
         <SettingSection
           icon={<Shuffle className="h-4 w-4 text-emerald-500" />}

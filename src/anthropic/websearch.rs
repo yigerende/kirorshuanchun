@@ -257,6 +257,10 @@ fn generate_websearch_events(
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
 ) -> Vec<SseEvent> {
+    let input_tokens = crate::downstream_usage::replace_zero(
+        input_tokens,
+        crate::downstream_usage::policy().zero_replacement(),
+    );
     let mut events = Vec::new();
     let message_id = format!(
         "msg_{}",

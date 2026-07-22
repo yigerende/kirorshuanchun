@@ -187,6 +187,11 @@ impl ResponseCache {
         inner.entries.retain(|_, v| !v.is_expired(now));
     }
 
+    /// 清空全部响应。出站响应格式/兼容策略变化时调用，避免回放按旧策略序列化的字节。
+    pub fn clear(&self) {
+        self.inner.lock().entries.clear();
+    }
+
     /// 启动后台周期任务：每 60s 清理过期条目。持 Weak，缓存被释放即自动退出。
     pub fn spawn_background(self: Arc<Self>) {
         let weak = Arc::downgrade(&self);

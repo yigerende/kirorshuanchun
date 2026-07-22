@@ -1176,6 +1176,9 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
+    /// 本响应专用的 0 输入 Token 替代值。随机模式在构造时只采样一次，保证同一条
+    /// SSE 的 message_start 与 message_delta 始终一致。
+    downstream_zero_input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
@@ -1248,6 +1251,10 @@ impl StreamContext {
         // split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径（超报）。
         self.cache_usage.split_final(self.input_tokens.max(0))
     }
+
+    fn downstream_input_tokens(&self, input_tokens: i32) -> i32 {
+        crate::downstream_usage::replace_zero(input_tokens, self.downstream_zero_input_tokens)
+    }
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1261,6 +1268,7 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
+            downstream_zero_input_tokens: crate::downstream_usage::policy().zero_replacement(),
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -1298,7 +1306,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": self.downstream_input_tokens(self.input_tokens),
                     "output_tokens": 1,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0,
@@ -2227,7 +2235,7 @@ impl StreamContext {
             let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
             let (creation_5m, creation_1h) = self.cache_usage.creation_split(cache_creation);
             events.extend(self.state_manager.generate_final_events(
-                final_input_tokens,
+                self.downstream_input_tokens(final_input_tokens),
                 self.output_tokens,
                 creation_5m,
                 creation_1h,
@@ -2329,7 +2337,7 @@ impl StreamContext {
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
+            self.downstream_input_tokens(final_input_tokens),
             self.output_tokens,
             creation_5m,
             creation_1h,
@@ -2434,7 +2442,9 @@ impl BufferedStreamContext {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(
+                            self.inner.downstream_input_tokens(final_input_tokens)
+                        );
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                         usage["cache_creation"] = serde_json::json!({
@@ -2581,7 +2591,9 @@ impl GatedStreamContext {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(
+                            self.inner.downstream_input_tokens(final_input_tokens)
+                        );
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                         usage["cache_creation"] = serde_json::json!({
@@ -5269,5 +5281,33 @@ mod tests {
         // 无上游信号：本地 input_tokens。
         ctx.context_input_tokens = None;
         assert_eq!(ctx.resolved_usage().0, 120_000, "本地 input_tokens");
+    }
+
+    #[test]
+    fn zero_input_is_replaced_only_in_downstream_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            0,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+
+        assert_eq!(ctx.resolved_usage().0, 0, "内部日志/计费口径必须保持真实 0");
+
+        let initial = ctx.generate_initial_events();
+        let start = initial
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start");
+        assert_eq!(start.data["message"]["usage"]["input_tokens"], 1);
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta.data["usage"]["input_tokens"], 1);
+        assert_eq!(ctx.resolved_usage().0, 0, "生成响应后内部值仍必须保持 0");
     }
 }

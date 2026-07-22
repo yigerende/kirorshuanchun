@@ -157,6 +157,7 @@ impl ImportItemResult {
             summary: None,
         }
     }
+
 }
 
 /// 缓存的"检查更新"结果
@@ -2266,6 +2267,7 @@ impl AdminService {
             .as_ref()
             .map(|c| (c.default_enabled(), c.default_ttl_secs()))
             .unwrap_or((false, crate::anthropic::response_cache::DEFAULT_TTL_SECS));
+        let downstream = crate::downstream_usage::policy().settings();
         RuntimeGovernanceConfigResponse {
             quota_disable_threshold: *self.quota_disable_threshold.lock(),
             response_cache_enabled: rc_enabled,
@@ -2280,6 +2282,10 @@ impl AdminService {
                 .as_ref()
                 .map(|g| g.ttl_secs())
                 .unwrap_or(300),
+            downstream_input_token_mode: downstream.mode,
+            downstream_input_token_fixed: downstream.fixed,
+            downstream_input_token_random_min: downstream.random_min,
+            downstream_input_token_random_max: downstream.random_max,
         }
     }
 
@@ -2294,10 +2300,13 @@ impl AdminService {
             && req.response_cache_ttl_secs.is_none()
             && req.cache_read_ratio.is_none()
             && req.cache_meter_ttl_secs.is_none()
+            && req.downstream_input_token_mode.is_none()
+            && req.downstream_input_token_fixed.is_none()
+            && req.downstream_input_token_random_min.is_none()
+            && req.downstream_input_token_random_max.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
-                    .to_string(),
+                "至少提供一个运行时治理配置字段".to_string(),
             ));
         }
         // 校验范围
@@ -2334,6 +2343,38 @@ impl AdminService {
             }
         }
 
+        let current_downstream = crate::downstream_usage::policy().settings();
+        let downstream = crate::downstream_usage::DownstreamInputTokenSettings {
+            mode: req
+                .downstream_input_token_mode
+                .unwrap_or(current_downstream.mode),
+            fixed: req
+                .downstream_input_token_fixed
+                .unwrap_or(current_downstream.fixed),
+            random_min: req
+                .downstream_input_token_random_min
+                .unwrap_or(current_downstream.random_min),
+            random_max: req
+                .downstream_input_token_random_max
+                .unwrap_or(current_downstream.random_max),
+        };
+        let max_value = crate::downstream_usage::MAX_REPLACEMENT_TOKENS;
+        if !(1..=max_value).contains(&downstream.fixed) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "downstreamInputTokenFixed 必须在 1..={} 内: {}",
+                max_value, downstream.fixed
+            )));
+        }
+        if !(1..=max_value).contains(&downstream.random_min)
+            || !(1..=max_value).contains(&downstream.random_max)
+            || downstream.random_min > downstream.random_max
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "下游输入 Token 随机范围必须满足 1 <= min <= max <= {}",
+                max_value
+            )));
+        }
+
         // 先改运行时值
         if let Some(t) = req.quota_disable_threshold {
             *self.quota_disable_threshold.lock() = t;
@@ -2358,6 +2399,17 @@ impl AdminService {
                 g.set_ttl_secs(ttl);
             }
         }
+        crate::downstream_usage::policy().configure(downstream);
+        // 缓存保存的是已序列化响应；策略改变后必须清空，防止继续回放旧的 0 或旧随机值。
+        if req.downstream_input_token_mode.is_some()
+            || req.downstream_input_token_fixed.is_some()
+            || req.downstream_input_token_random_min.is_some()
+            || req.downstream_input_token_random_max.is_some()
+        {
+            if let Some(c) = &self.response_cache {
+                c.clear();
+            }
+        }
 
         // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
         self.update_config_file(|c| {
@@ -2376,6 +2428,10 @@ impl AdminService {
             if let Some(ttl) = req.cache_meter_ttl_secs {
                 c.cache_meter_ttl_secs = ttl;
             }
+            c.downstream_input_token_mode = downstream.mode;
+            c.downstream_input_token_fixed = downstream.fixed;
+            c.downstream_input_token_random_min = downstream.random_min;
+            c.downstream_input_token_random_max = downstream.random_max;
         });
 
         Ok(self.get_runtime_governance_config())
@@ -3092,7 +3148,6 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
-
 }
 
 #[cfg(test)]

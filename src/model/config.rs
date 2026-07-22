@@ -264,6 +264,22 @@ pub struct Config {
     #[serde(default = "default_response_cache_capacity")]
     pub response_cache_capacity: usize,
 
+    /// 下游响应中 input_tokens/prompt_tokens 为 0 时的替换模式。
+    #[serde(default)]
+    pub downstream_input_token_mode: crate::downstream_usage::DownstreamInputTokenMode,
+
+    /// 固定模式替代值（默认 1）。仅影响最终响应，不影响内部日志和计费。
+    #[serde(default = "default_downstream_input_token_value")]
+    pub downstream_input_token_fixed: u32,
+
+    /// 随机模式闭区间下限（默认 1）。
+    #[serde(default = "default_downstream_input_token_value")]
+    pub downstream_input_token_random_min: u32,
+
+    /// 随机模式闭区间上限（默认 1）。
+    #[serde(default = "default_downstream_input_token_value")]
+    pub downstream_input_token_random_max: u32,
+
     /// OpenAI 端点的可配置模型映射规则（全局，运行时经 Admin API 热编辑）。
     /// 客户端模型名按规则映射到目标 Claude 模型名，再交给下游解析。空表示不映射。
     #[serde(default)]
@@ -465,6 +481,10 @@ fn default_response_cache_capacity() -> usize {
     crate::anthropic::response_cache::DEFAULT_CAPACITY
 }
 
+fn default_downstream_input_token_value() -> u32 {
+    1
+}
+
 fn default_quota_disable_threshold() -> f64 {
     // 默认 100 = 关闭"按百分比主动禁用":凭据用满 100% 乃至溢出(超额),
     // 仅靠上游 402 请求错误(MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED)判定不可用。
@@ -520,6 +540,10 @@ impl Default for Config {
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
+            downstream_input_token_mode: Default::default(),
+            downstream_input_token_fixed: default_downstream_input_token_value(),
+            downstream_input_token_random_min: default_downstream_input_token_value(),
+            downstream_input_token_random_max: default_downstream_input_token_value(),
             model_mappings: Vec::new(),
             default_simplify_cc_prompt: false,
             default_strip_boundary_markers: false,
@@ -594,5 +618,22 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_downstream_token_fields_uses_fixed_one() {
+        let config: Config = serde_json::from_str("{}").expect("旧配置应保持兼容");
+        assert_eq!(
+            config.downstream_input_token_mode,
+            crate::downstream_usage::DownstreamInputTokenMode::Fixed
+        );
+        assert_eq!(config.downstream_input_token_fixed, 1);
+        assert_eq!(config.downstream_input_token_random_min, 1);
+        assert_eq!(config.downstream_input_token_random_max, 1);
     }
 }

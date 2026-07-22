@@ -714,6 +714,10 @@ fn render_json(
     input_tokens: i32,
     output_tokens: i32,
 ) -> Response {
+    let input_tokens = crate::downstream_usage::replace_zero(
+        input_tokens,
+        crate::downstream_usage::policy().zero_replacement(),
+    );
     let body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -767,6 +771,10 @@ fn build_sse_events(
     input_tokens: i32,
     output_tokens: i32,
 ) -> Vec<SseEvent> {
+    let input_tokens = crate::downstream_usage::replace_zero(
+        input_tokens,
+        crate::downstream_usage::policy().zero_replacement(),
+    );
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 

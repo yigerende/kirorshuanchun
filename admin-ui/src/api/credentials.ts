@@ -484,6 +484,11 @@ export interface RuntimeGovernanceConfig {
   cacheReadRatio: number
   /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
   cacheMeterTtlSecs: number
+  /** 最终响应 input_tokens/prompt_tokens 为 0 时的替换模式。 */
+  downstreamInputTokenMode: 'fixed' | 'random'
+  downstreamInputTokenFixed: number
+  downstreamInputTokenRandomMin: number
+  downstreamInputTokenRandomMax: number
 }
 
 // 获取运行时治理配置

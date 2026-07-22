@@ -28,9 +28,15 @@ pub struct OpenAiUsage {
 
 impl OpenAiUsage {
     fn to_json(self) -> Value {
+        let raw_prompt_tokens = self.prompt_tokens.max(0);
+        let downstream_prompt_tokens = crate::downstream_usage::replace_zero(
+            raw_prompt_tokens,
+            crate::downstream_usage::policy().zero_replacement(),
+        );
         json!({
-            "prompt_tokens": self.prompt_tokens.max(0),
+            "prompt_tokens": downstream_prompt_tokens,
             "completion_tokens": self.completion_tokens.max(0),
+            // 只替换输入字段；总量继续按原始 input + output 计算。
             "total_tokens": (self.prompt_tokens + self.completion_tokens).max(0),
         })
     }
@@ -435,6 +441,18 @@ mod tests {
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(body["usage"]["prompt_tokens"], 10);
         assert_eq!(body["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn zero_prompt_tokens_only_changes_downstream_prompt_field() {
+        let b = OpenAiResponseBuilder::new("m");
+        let body = b.build_completion(OpenAiUsage {
+            prompt_tokens: 0,
+            completion_tokens: 3,
+        });
+        assert_eq!(body["usage"]["prompt_tokens"], 1);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert_eq!(body["usage"]["total_tokens"], 3);
     }
 
     #[test]
